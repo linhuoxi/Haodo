@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>Haodo</AssemblyName>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**</DefaultItemExcludes>
+    
+    <VersionFilePath Condition="Exists('$(MSBuildProjectDirectory)\..\版本号.txt')">$(MSBuildProjectDirectory)\..\版本号.txt</VersionFilePath>
+    <VersionFilePath Condition="!Exists('$(MSBuildProjectDirectory)\..\版本号.txt')">$(MSBuildProjectDirectory)\..\VERSION.txt</VersionFilePath>
+    <RawVersion>$([System.IO.File]::ReadAllText('$(VersionFilePath)').Trim())</RawVersion>
+    <Version>$([System.Text.RegularExpressions.Regex]::Replace('$(RawVersion)', '^[vV\s]+|[^\d\.\w-].*', ''))</Version>
+    <AssemblyVersion>$(Version).0</AssemblyVersion>
+    <FileVersion>$(Version).0</FileVersion>
+    <ProductVersion>$(Version)</ProductVersion>
+    
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <Target Name="ValidateVersionFile" BeforeTargets="BeforeBuild;BeforeRebuild;BeforePublish">
+    <Error Condition="!Exists('$(VersionFilePath)')" Text="[Build Error] Cannot find 版本号.txt or VERSION.txt in root directory." />
+    <Error Condition="'$(Version)' == ''" Text="[Build Error] Version file is empty or invalid." />
+    <Message Importance="high" Text="[Version Check] Successfully confirmed version v$(Version) from $(VersionFilePath)" />
+  </Target>
+
+  <ItemGroup>
+    <Resource Include="app.ico" />
+  </ItemGroup>
+
+</Project>
+
+
