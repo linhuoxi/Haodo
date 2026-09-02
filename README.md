@@ -105,6 +105,16 @@ Haodo/
 
 ---
 
+## 🙏 致谢与项目来源说明
+
+本项目在设计与协议转换架构上深受优秀开源项目 **[CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI)** 的启发，并基于其核心协议转换理念与经验实现了 C# .NET 10 / WPF 原生版本：
+
+- 🌟 **核心上游项目**: [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+- 💡 **特别致谢**: 感谢 **Luis Pater** 与 **Router-For.ME** 团队以及开源社区在 AI CLI 协议代理、多账号轮询与模型适配领域的卓越探索与开源贡献！
+
+---
+
 ## 📄 开源许可证
 
-本项目采用 [MIT License](LICENSE) 开源协议。
+本项目与上游 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 一致采用 **[MIT License](LICENSE)** 开源协议。无论是个人使用、学习还是商业衍生均保持开放自由。
+
