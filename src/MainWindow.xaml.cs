@@ -36,6 +36,9 @@ namespace CLIProxyAPI_GUI
         [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
         private const uint SWP_NOMOVE = 0x0002;
         private const uint SWP_NOSIZE = 0x0001;
         private const uint SWP_NOZORDER = 0x0004;
@@ -85,7 +88,14 @@ namespace CLIProxyAPI_GUI
         private string _mainWinState = "normal"; // "normal" / "maximized"
 
         private int _autoRefreshIntervalMinutes = 5;
+        private bool _warmupEnabled = false;
+        private bool _isWarmingUp = false;
+        private bool _isWarmupLogPlaceholder = true;
         private bool _autoCheckUpdateEnabled = true; // 启动时自动静默检查更新
+        private bool _autoStartEnabled = false; // 开机自启动
+        private const string RunRegistryKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string AppRegistryName = "Haodo";
+        private readonly bool _isAutoStart = false; // 是否通过开机自启参数启动
         private string _themeMode = "system"; // "system" / "dark" / "light"
         private string _miniWidgetColor = "#FFFFFF";
 
@@ -96,13 +106,17 @@ namespace CLIProxyAPI_GUI
         private int _localProxyPort = 8317;
         private string _localProxyApiKey = "sk-haodo-local";
         private System.Windows.Threading.DispatcherTimer? _autoRefreshTimer;
+        private System.Windows.Threading.DispatcherTimer? _countdownTimer;
+        private int _countdownTickCounter = 0;
         private System.Windows.Threading.DispatcherTimer? _miniOpacitySaveTimer;
+        private readonly List<TextBlock> _countdownTextBlocks = new();
+        private readonly Dictionary<string, DateTime> _lastWarmupTimestamps = new(StringComparer.OrdinalIgnoreCase);
         private List<string> _jsonFilePaths = new();
         private string? _selectedAccountFile = null;
         private MiniWidgetWindow? _miniWidget = null;
         private System.Windows.Forms.NotifyIcon? _notifyIcon = null;
         private int _currentMiniAccountIndex = 0;
-        private List<(AccountInfo acc, ((int percent, string time) g5h, (int percent, string time) gWeek, (int percent, string time) c5h, (int percent, string time) cWeek) quota)> _cachedQuotas = new();
+        private List<(AccountInfo acc, ((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek, (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek) quota)> _cachedQuotas = new();
 
         // ===== Google Drive 配置同步（设置页「同步」卡片） =====
         // 说明：Google 官方允许 Desktop Installed App 客户端内嵌公开 OAuth 凭据，运行时动态解码
@@ -125,7 +139,7 @@ namespace CLIProxyAPI_GUI
         private readonly object _oauthLock = new object();
 
         // 最近一次成功查询的配额（文件路径 → 配额）。网络异常/代理故障导致本次查询失败时，降级显示上次成功数据，避免误导性“全部 0%”
-        private readonly Dictionary<string, ((int percent, string time) g5h, (int percent, string time) gWeek, (int percent, string time) c5h, (int percent, string time) cWeek)> _lastGoodQuotas = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, ((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek, (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek)> _lastGoodQuotas = new(StringComparer.OrdinalIgnoreCase);
 
         private bool _isExiting = false;
         private bool _maskAccountInfo = false;
@@ -168,8 +182,13 @@ namespace CLIProxyAPI_GUI
             return isDark ? ("#2E1065", "#DDD6FE") : ("#F3E8FF", "#6B21A8");
         }
 
-        public MainWindow()
+        public MainWindow() : this(false)
         {
+        }
+
+        public MainWindow(bool isAutoStart)
+        {
+            _isAutoStart = isAutoStart;
             InitializeComponent();
             TxtVersionBadge.Text = $"v{CurrentVersionStr}";
             
@@ -210,6 +229,11 @@ namespace CLIProxyAPI_GUI
             // 旧版登录的 token 未含头像 URL → 启动后静默补齐
             _ = BackfillGooglePictureAsync();
             UpdateAutoCheckUpdateUI();
+            UpdateAutoStartSegmentUI();
+            TxtAutoRefreshInterval.Text = _autoRefreshIntervalMinutes.ToString();
+            UpdateWarmupSegmentUI();
+            // 静默核对并同步注册表（开启时校准最新 exe 路径，关闭时清理注册表残留）
+            SyncAutoStartRegistry(_autoStartEnabled, logQuiet: true);
             RestoreMainWindowState();
 
             // 主窗口位置/尺寸/最大化状态变更 → 防抖持久化
@@ -222,6 +246,7 @@ namespace CLIProxyAPI_GUI
             // 自动归集与整合数据文件夹中的凭证
             MigrateAndScanDataDirectory();
             InitAutoRefreshTimer();
+            InitCountdownTimer();
             InitLocalProxyServer();
 
             Log("[系统就绪] Haodo 已启动，数据已统一收拢");
@@ -232,6 +257,12 @@ namespace CLIProxyAPI_GUI
                 {
                     ApplyMiniWidgetSettings();
                     Log($"[贴贴模式] 已自动恢复贴贴形态 ({_miniModeType})");
+                }
+
+                if (_isAutoStart)
+                {
+                    this.Hide();
+                    Log("[自启动] 已以开机自启模式在后台静默就绪");
                 }
             };
 
@@ -386,13 +417,21 @@ namespace CLIProxyAPI_GUI
                     Text = "Haodo · 极简 AI 配额监测",
                     Visible = true
                 };
-                _notifyIcon.DoubleClick += (s, e) => ShowMainFromMini();
+                _notifyIcon.DoubleClick += (s, e) =>
+                {
+                    CloseTrayMenu();
+                    ShowMainFromMini();
+                };
                 // 不使用系统默认样式的 ContextMenuStrip；右键时弹出自绘圆角菜单
                 _notifyIcon.MouseUp += (s, e) =>
                 {
                     if (e.Button == System.Windows.Forms.MouseButtons.Right)
                     {
                         ShowTrayMenu();
+                    }
+                    else if (e.Button == System.Windows.Forms.MouseButtons.Left)
+                    {
+                        CloseTrayMenu();
                     }
                 };
             }
@@ -404,14 +443,14 @@ namespace CLIProxyAPI_GUI
 
         // ===== 托盘自绘圆角菜单（与贴贴右键菜单视觉一致） =====
 
-        private System.Windows.Controls.Primitives.Popup? _trayMenuPopup = null;
+        private Window? _trayMenuWindow = null;
 
         private void CloseTrayMenu()
         {
-            if (_trayMenuPopup != null)
+            if (_trayMenuWindow != null)
             {
-                try { _trayMenuPopup.IsOpen = false; } catch { }
-                _trayMenuPopup = null;
+                try { _trayMenuWindow.Close(); } catch { }
+                _trayMenuWindow = null;
             }
         }
 
@@ -465,6 +504,7 @@ namespace CLIProxyAPI_GUI
                 }
 
                 AddItem("打开主窗口", () => ShowMainFromMini());
+                AddItem("设置", () => OpenSettingsFromMini());
                 AddSeparator();
                 stack.Children.Add(new TextBlock
                 {
@@ -491,58 +531,127 @@ namespace CLIProxyAPI_GUI
                     BorderThickness = new Thickness(1),
                     CornerRadius = new CornerRadius(10),
                     Padding = new Thickness(4),
+                    Margin = new Thickness(12),
                     SnapsToDevicePixels = true,
                     UseLayoutRounding = true,
                     Child = stack,
                     Effect = new DropShadowEffect { BlurRadius = 14, ShadowDepth = 3, Opacity = 0.45, Color = Colors.Black }
                 };
 
-                // 使用 Popup 承载菜单：StaysOpen=false 时，点击菜单外任意位置（含任务栏/其他窗口/桌面）
-                // 会自动关闭，彻底解决"失去焦点菜单不消失"的问题。
-                var popup = new System.Windows.Controls.Primitives.Popup
+                // 使用无边框透明顶层 Window 承载菜单，彻底解决 WinForms NotifyIcon 弹出的 WPF 菜单失去焦点不关闭的系统级缺陷
+                var win = new Window
                 {
-                    Placement = System.Windows.Controls.Primitives.PlacementMode.Custom,
+                    WindowStyle = WindowStyle.None,
                     AllowsTransparency = true,
-                    StaysOpen = false,
-                    PopupAnimation = PopupAnimation.Fade,
-                    Child = border
+                    Background = Brushes.Transparent,
+                    ShowInTaskbar = false,
+                    Topmost = true,
+                    SizeToContent = SizeToContent.WidthAndHeight,
+                    ResizeMode = ResizeMode.NoResize,
+                    Content = border,
+                    ShowActivated = true
                 };
 
-                popup.CustomPopupPlacementCallback = (size, targetSize, offset) =>
+                // 计算位置与尺寸
+                border.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                double menuW = border.DesiredSize.Width;
+                double menuH = border.DesiredSize.Height;
+
+                var cursor = System.Windows.Forms.Cursor.Position;
+                var screen = System.Windows.Forms.Screen.FromPoint(cursor);
+                var workArea = screen.WorkingArea;
+
+                double devToDipX = 1.0;
+                double devToDipY = 1.0;
+                try
+                {
+                    var dpi = VisualTreeHelper.GetDpi(this);
+                    if (dpi.DpiScaleX > 0) devToDipX = 1.0 / dpi.DpiScaleX;
+                    if (dpi.DpiScaleY > 0) devToDipY = 1.0 / dpi.DpiScaleY;
+                }
+                catch
                 {
                     try
                     {
-                        var cursor = System.Windows.Forms.Cursor.Position; // 物理像素
-                        var src = PresentationSource.FromVisual(popup);
-                        double sx = src?.CompositionTarget.TransformFromDevice.M11 ?? 1.0;
-                        double sy = src?.CompositionTarget.TransformFromDevice.M22 ?? 1.0;
-                        double px = cursor.X / sx; // DIP 坐标
-                        double py = cursor.Y / sy;
-                        double x = px - size.Width - 8;
-                        double y = py - size.Height - 8;
-                        double workLeft = SystemParameters.VirtualScreenLeft;
-                        double workTop = SystemParameters.VirtualScreenTop;
-                        double workRight = workLeft + SystemParameters.VirtualScreenWidth;
-                        double workBottom = workTop + SystemParameters.VirtualScreenHeight;
-                        if (x < workLeft) x = Math.Min(px + 8, workRight - size.Width);
-                        if (y < workTop) y = Math.Min(py + 8, workBottom - size.Height);
-                        x = Math.Max(workLeft, x);
-                        y = Math.Max(workTop, y);
-                        return new[] { new CustomPopupPlacement(new Point(x, y), PopupPrimaryAxis.None) };
+                        var src = PresentationSource.FromVisual(this);
+                        if (src?.CompositionTarget != null)
+                        {
+                            devToDipX = src.CompositionTarget.TransformFromDevice.M11;
+                            devToDipY = src.CompositionTarget.TransformFromDevice.M22;
+                        }
                     }
-                    catch
-                    {
-                        return new[] { new CustomPopupPlacement(new Point(0, 0), PopupPrimaryAxis.None) };
-                    }
-                };
+                    catch { }
+                }
 
-                popup.Closed += (s, e) =>
+                double mouseDipX = cursor.X * devToDipX;
+                double mouseDipY = cursor.Y * devToDipY;
+                double workLeftDip = workArea.Left * devToDipX;
+                double workTopDip = workArea.Top * devToDipY;
+                double workRightDip = (workArea.Left + workArea.Width) * devToDipX;
+                double workBottomDip = (workArea.Top + workArea.Height) * devToDipY;
+
+                // 默认置于鼠标左上方（任务栏在右下方常见场景），考虑 12px 阴影边距
+                double x = mouseDipX - menuW + 12;
+                double y = mouseDipY - menuH + 12;
+
+                if (x < workLeftDip) x = mouseDipX - 12;
+                if (y < workTopDip) y = mouseDipY - 12;
+                if (x + menuW > workRightDip) x = workRightDip - menuW;
+                if (y + menuH > workBottomDip) y = workBottomDip - menuH;
+
+                win.Left = x;
+                win.Top = y;
+
+                bool isReady = false;
+                win.Loaded += (s, e) =>
                 {
-                    if (_trayMenuPopup == popup) _trayMenuPopup = null;
+                    isReady = true;
+                    win.Activate();
+                    try
+                    {
+                        var handle = new WindowInteropHelper(win).Handle;
+                        if (handle != IntPtr.Zero)
+                        {
+                            SetForegroundWindow(handle);
+                        }
+                    }
+                    catch { }
                 };
 
-                _trayMenuPopup = popup;
-                popup.IsOpen = true;
+                // 失去焦点时自动关闭，解决失去焦点后菜单不消失的问题
+                win.Deactivated += (s, e) =>
+                {
+                    if (isReady && _trayMenuWindow == win)
+                    {
+                        CloseTrayMenu();
+                    }
+                };
+
+                win.KeyDown += (s, e) =>
+                {
+                    if (e.Key == Key.Escape)
+                    {
+                        CloseTrayMenu();
+                    }
+                };
+
+                win.Closed += (s, e) =>
+                {
+                    if (_trayMenuWindow == win) _trayMenuWindow = null;
+                };
+
+                _trayMenuWindow = win;
+                win.Show();
+                win.Activate();
+                try
+                {
+                    var handle = new WindowInteropHelper(win).Handle;
+                    if (handle != IntPtr.Zero)
+                    {
+                        SetForegroundWindow(handle);
+                    }
+                }
+                catch { }
             }
             catch (Exception ex)
             {
@@ -783,7 +892,7 @@ namespace CLIProxyAPI_GUI
                 var accounts = LoadAllAccounts();
                 if (accounts.Count > 0)
                 {
-                    var fallbackQuota = ((100, "就绪"), (100, "就绪"), (100, "就绪"), (100, "就绪"));
+                    var fallbackQuota = ((100, "就绪", (DateTime?)null), (100, "就绪", (DateTime?)null), (100, "就绪", (DateTime?)null), (100, "就绪", (DateTime?)null));
                     _cachedQuotas = accounts.Select(a => (a, fallbackQuota)).ToList();
                 }
             }
@@ -1042,10 +1151,24 @@ namespace CLIProxyAPI_GUI
                             _autoRefreshIntervalMinutes = interval;
                         }
                     }
+                    else if (doc.RootElement.TryGetProperty("autoRefreshEnabled", out var pAutoRefEnabled) && !pAutoRefEnabled.GetBoolean())
+                    {
+                        _autoRefreshIntervalMinutes = 0;
+                    }
+
+                    if (doc.RootElement.TryGetProperty("warmupEnabled", out var pWarmupEnabled))
+                    {
+                        _warmupEnabled = pWarmupEnabled.GetBoolean();
+                    }
 
                     if (doc.RootElement.TryGetProperty("autoCheckUpdateEnabled", out var pAutoCheck))
                     {
                         _autoCheckUpdateEnabled = pAutoCheck.GetBoolean();
+                    }
+
+                    if (doc.RootElement.TryGetProperty("autoStartEnabled", out var pAutoStart))
+                    {
+                        _autoStartEnabled = pAutoStart.GetBoolean();
                     }
 
                     if (doc.RootElement.TryGetProperty("maskAccountInfo", out var pMask))
@@ -1143,7 +1266,9 @@ namespace CLIProxyAPI_GUI
                     mainWinHeight = _mainWinHeight,
                     mainWinState = _mainWinState,
                     autoRefreshIntervalMinutes = _autoRefreshIntervalMinutes,
+                    warmupEnabled = _warmupEnabled,
                     autoCheckUpdateEnabled = _autoCheckUpdateEnabled,
+                    autoStartEnabled = _autoStartEnabled,
                     themeMode = _themeMode,
                     maskAccountInfo = _maskAccountInfo,
                     miniWidgetColor = _miniWidgetColor,
@@ -1265,6 +1390,8 @@ namespace CLIProxyAPI_GUI
                     ApplyMiniWidgetSettings();      // 贴贴开关/模式/样式按最新配置重建
                     UpdateMiniWidgetColorSettingsUI();
                     UpdateMaskAccountSegmentUI();
+                    UpdateAutoStartSegmentUI();
+                    UpdateWarmupSegmentUI();
                     ResetAutoRefreshTimer();        // 自动刷新间隔若变更则按新值生效
                     UpdateAutoCheckUpdateUI();      // 同步自动检查更新开关状态
                     UpdateGDriveUI();               // 同步卡片连接状态/最近同步时间
@@ -1288,6 +1415,8 @@ namespace CLIProxyAPI_GUI
                 ApplyMiniWidgetSettings();      // 贴贴开关/模式/样式按最新配置重建
                 UpdateMiniWidgetColorSettingsUI();
                 UpdateMaskAccountSegmentUI();
+                UpdateAutoStartSegmentUI();
+                UpdateWarmupSegmentUI();
                 ResetAutoRefreshTimer();        // 自动刷新间隔若变更则按新值生效
 
                 // 2. 归集扫描凭证 + 净化持久化（把最新配置与扫描结果写回 settings.json）
@@ -1642,8 +1771,11 @@ namespace CLIProxyAPI_GUI
                 ApplyTheme();
                 UpdateThemeSegmentedUI();
                 UpdateSettingsSegmentedSwitchUI();
+                UpdateWarmupSegmentUI();
+                ResetAutoRefreshTimer();
                 UpdateAutoCheckUpdateUI();
                 UpdateMaskAccountSegmentUI();
+                UpdateAutoStartSegmentUI();
                 UpdateMiniWidgetColorSettingsUI();
                 RenderSettingsFilesList();
                 RefreshAccounts();
@@ -1682,7 +1814,10 @@ namespace CLIProxyAPI_GUI
             _mainWinHeight = 0;
             _mainWinState = "normal";
             _autoRefreshIntervalMinutes = 5;
+            _warmupEnabled = false;
             _autoCheckUpdateEnabled = true;
+            _autoStartEnabled = false;
+            try { SyncAutoStartRegistry(false, logQuiet: true); } catch { }
             _themeMode = "system";
             _maskAccountInfo = false;
             _miniWidgetColor = "#FFFFFF";
@@ -2390,17 +2525,17 @@ namespace CLIProxyAPI_GUI
                 ResetAutoRefreshTimer();
                 if (minutes > 0)
                 {
-                    Log($"[定时刷新] 已更新为每 {minutes} 分钟自动刷新一次配额");
+                    Log($"[自动刷新] 已设置为每 {minutes} 分钟自动刷新一次配额");
                 }
                 else
                 {
-                    Log("[定时刷新] 已关闭后台自动刷新");
+                    Log("[自动刷新] 自动刷新已关闭（间隔设为 0 分钟）");
                 }
             }
             else
             {
                 TxtAutoRefreshInterval.Text = _autoRefreshIntervalMinutes.ToString();
-                Log("[警告] 刷新间隔请输入大于等于 0 的整数");
+                Log("[警告] 刷新间隔请输入大于等于 0 的整数（分钟，0 为关闭）");
             }
         }
 
@@ -2411,9 +2546,9 @@ namespace CLIProxyAPI_GUI
                 _autoRefreshTimer = new System.Windows.Threading.DispatcherTimer();
                 _autoRefreshTimer.Tick += (s, e) =>
                 {
-                    if (_jsonFilePaths.Count > 0)
+                    if (_jsonFilePaths.Count > 0 && _autoRefreshIntervalMinutes > 0)
                     {
-                        Log($"[定时刷新] 触发自动刷新配额 ({_autoRefreshIntervalMinutes} 分钟间隔)...");
+                        Log($"[自动刷新] 触发自动刷新配额 ({_autoRefreshIntervalMinutes} 分钟间隔)...");
                         RefreshAccounts();
                     }
                 };
@@ -2434,6 +2569,254 @@ namespace CLIProxyAPI_GUI
                 }
             }
             catch { }
+        }
+
+        private void InitCountdownTimer()
+        {
+            try
+            {
+                _countdownTimer = new System.Windows.Threading.DispatcherTimer
+                {
+                    Interval = TimeSpan.FromSeconds(1)
+                };
+                _countdownTimer.Tick += (s, e) => UpdateActiveCountdowns();
+                _countdownTimer.Start();
+            }
+            catch { }
+        }
+
+        private void UpdateActiveCountdowns()
+        {
+            if (_countdownTextBlocks.Count == 0 && _cachedQuotas.Count == 0) return;
+
+            // 1. 本地动态递减卡片 UI 上的各倒计时 TextBlock 文本
+            for (int i = _countdownTextBlocks.Count - 1; i >= 0; i--)
+            {
+                var tb = _countdownTextBlocks[i];
+                if (tb.Tag is DateTime resetUtc)
+                {
+                    string newText = FormatResetTime(resetUtc);
+                    if (tb.Text != newText)
+                    {
+                        tb.Text = newText;
+                    }
+                }
+            }
+
+            // 2. 同步更新 _cachedQuotas 内存中的格式化时间文本（确保微贴与悬浮提示实时递减）
+            bool quotaChanged = false;
+            for (int i = 0; i < _cachedQuotas.Count; i++)
+            {
+                var item = _cachedQuotas[i];
+                var (g5h, gWeek, c5h, cWeek) = item.quota;
+                bool changed = false;
+
+                if (g5h.resetUtc.HasValue)
+                {
+                    string nt = FormatResetTime(g5h.resetUtc);
+                    if (g5h.time != nt) { g5h = (g5h.percent, nt, g5h.resetUtc); changed = true; }
+                }
+                if (gWeek.resetUtc.HasValue)
+                {
+                    string nt = FormatResetTime(gWeek.resetUtc);
+                    if (gWeek.time != nt) { gWeek = (gWeek.percent, nt, gWeek.resetUtc); changed = true; }
+                }
+                if (c5h.resetUtc.HasValue)
+                {
+                    string nt = FormatResetTime(c5h.resetUtc);
+                    if (c5h.time != nt) { c5h = (c5h.percent, nt, c5h.resetUtc); changed = true; }
+                }
+                if (cWeek.resetUtc.HasValue)
+                {
+                    string nt = FormatResetTime(cWeek.resetUtc);
+                    if (cWeek.time != nt) { cWeek = (cWeek.percent, nt, cWeek.resetUtc); changed = true; }
+                }
+
+                if (changed)
+                {
+                    _cachedQuotas[i] = (item.acc, (g5h, gWeek, c5h, cWeek));
+                    quotaChanged = true;
+                }
+            }
+
+            // 3. 若配额文本发生变更，同步通知 MiniWidget 悬浮贴贴刷新浮动提示与文本
+            if (quotaChanged && _miniWidget != null && _miniWidget.IsVisible)
+            {
+                UpdateMiniWidgetData();
+            }
+
+            // 4. 定时预热闭环：每 30 秒进行一次巡检，若有 100% 满额冷态账号或倒计时到期账号，自动触发直连握手激活
+            _countdownTickCounter++;
+            if (_countdownTickCounter >= 30)
+            {
+                _countdownTickCounter = 0;
+                if (IsWarmupActive() && !_isWarmingUp && _cachedQuotas.Count > 0)
+                {
+                    bool anyNeeds = _cachedQuotas.Any(q =>
+                        !q.acc.Disabled &&
+                        (NeedsWarmup(q.quota.g5h, q.acc.FilePath, "gemini").needWarmup ||
+                         NeedsWarmup(q.quota.c5h, q.acc.FilePath, "claude").needWarmup));
+
+                    if (anyNeeds)
+                    {
+                        _ = CheckAndRunScheduledWarmupAsync();
+                    }
+                }
+            }
+        }
+
+        // =================== 定时预热管理 ===================
+
+        private void BtnWarmupOff_Click(object sender, RoutedEventArgs e)
+        {
+            SetWarmupState(false);
+        }
+
+        private void BtnWarmupOn_Click(object sender, RoutedEventArgs e)
+        {
+            SetWarmupState(true);
+        }
+
+        private void SetWarmupStatus(string text, string colorHex)
+        {
+            try
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (TxtWarmupStatus == null) return;
+                    TxtWarmupStatus.Text = text;
+                    TxtWarmupStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colorHex));
+                });
+            }
+            catch { }
+        }
+
+        private void AppendWarmupLog(string message)
+        {
+            try
+            {
+                if (_maskAccountInfo)
+                {
+                    message = MaskEmailsInText(message);
+                }
+
+                Dispatcher.Invoke(() =>
+                {
+                    if (TxtWarmupLog == null) return;
+
+                    if (_isWarmupLogPlaceholder)
+                    {
+                        TxtWarmupLog.Text = "";
+                        TxtWarmupLog.Foreground = (Brush)FindResource("ThemeTextPrimary");
+                        _isWarmupLogPlaceholder = false;
+                    }
+
+                    if (string.IsNullOrEmpty(TxtWarmupLog.Text))
+                    {
+                        TxtWarmupLog.Text = message;
+                    }
+                    else
+                    {
+                        TxtWarmupLog.AppendText(Environment.NewLine + message);
+                    }
+
+                    // 保持日志不超过 100 行，防止内存无界增长
+                    var lines = TxtWarmupLog.Text.Split('\n');
+                    if (lines.Length > 100)
+                    {
+                        TxtWarmupLog.Text = string.Join("\n", lines.Skip(lines.Length - 100));
+                    }
+
+                    ScrollWarmupLog?.ScrollToEnd();
+                });
+            }
+            catch { }
+        }
+
+        private void BtnClearWarmupLog_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                TxtWarmupLog.Text = "（预热日志已清空）";
+                TxtWarmupLog.Foreground = (Brush)FindResource("ThemeTextSecondary");
+                _isWarmupLogPlaceholder = true;
+                SetWarmupStatus(_warmupEnabled ? "定时预热已开启，就绪" : "定时预热已关闭", _warmupEnabled ? "#16A34A" : "#94A3B8");
+            }
+            catch { }
+        }
+
+        private void BtnCopyWarmupLog_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(TxtWarmupLog.Text))
+                {
+                    Clipboard.SetText(TxtWarmupLog.Text);
+                    SetWarmupStatus("已复制预热日志到剪贴板", "#16A34A");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[定时预热] 复制预热日志异常: {ex.Message}");
+            }
+        }
+
+        private void SetWarmupState(bool enabled)
+        {
+            if (_warmupEnabled == enabled) return;
+            _warmupEnabled = enabled;
+            SaveSettings();
+            UpdateWarmupSegmentUI();
+
+            if (_warmupEnabled)
+            {
+                SetWarmupStatus("定时预热已开启，就绪", "#16A34A");
+                AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] 定时预热已开启，自动刷新后将自动对 100% 满额账号执行握手唤醒。");
+                Log("[定时预热] 已开启，自动刷新后将自动对 100% 满额账号执行握手唤醒");
+                if (_cachedQuotas.Count > 0)
+                {
+                    _ = CheckAndRunScheduledWarmupAsync();
+                }
+                else
+                {
+                    RefreshAccounts();
+                }
+            }
+            else
+            {
+                SetWarmupStatus("定时预热已关闭", "#94A3B8");
+                AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] 定时预热已关闭。");
+                Log("[定时预热] 已关闭");
+            }
+        }
+
+        private void UpdateWarmupSegmentUI()
+        {
+            try
+            {
+                var active = (Style)FindResource("BtnSegmentActive");
+                var inactive = (Style)FindResource("BtnSegmentInactive");
+                BtnWarmupOff.Style = !_warmupEnabled ? active : inactive;
+                BtnWarmupOn.Style = _warmupEnabled ? active : inactive;
+
+                if (TxtWarmupStatus != null && (TxtWarmupStatus.Text == "尚未执行预热" || TxtWarmupStatus.Text == "定时预热已开启，等待自动刷新" || TxtWarmupStatus.Text == "定时预热已关闭"))
+                {
+                    if (_warmupEnabled)
+                    {
+                        SetWarmupStatus("定时预热已开启，等待自动刷新", "#16A34A");
+                    }
+                    else
+                    {
+                        SetWarmupStatus("定时预热已关闭", "#94A3B8");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private bool IsWarmupActive()
+        {
+            return _warmupEnabled;
         }
 
         private void BtnOpenDataDir_Click(object sender, RoutedEventArgs e)
@@ -3101,6 +3484,7 @@ namespace CLIProxyAPI_GUI
                 ["themeMode"] = _themeMode,
                 ["maskAccountInfo"] = _maskAccountInfo,
                 ["autoRefreshIntervalMinutes"] = _autoRefreshIntervalMinutes,
+                ["warmupEnabled"] = _warmupEnabled,
                 ["autoCheckUpdateEnabled"] = _autoCheckUpdateEnabled,
                 ["miniModeType"] = _miniModeType,
                 ["miniWidgetBgColor"] = _miniWidgetBgColor,
@@ -3146,8 +3530,17 @@ namespace CLIProxyAPI_GUI
                 }
                 if (r.TryGetProperty("maskAccountInfo", out var p1)) _maskAccountInfo = p1.GetBoolean();
                 if (r.TryGetProperty("autoRefreshIntervalMinutes", out var p2) && p2.TryGetInt32(out int v2))
-                    _autoRefreshIntervalMinutes = Math.Clamp(v2, 1, 1440);
+                    _autoRefreshIntervalMinutes = Math.Clamp(v2, 0, 1440);
+                else if (r.TryGetProperty("autoRefreshEnabled", out var pAre) && !pAre.GetBoolean())
+                    _autoRefreshIntervalMinutes = 0;
+
+                if (r.TryGetProperty("warmupEnabled", out var pWe)) _warmupEnabled = pWe.GetBoolean();
                 if (r.TryGetProperty("autoCheckUpdateEnabled", out var p3)) _autoCheckUpdateEnabled = p3.GetBoolean();
+                if (r.TryGetProperty("autoStartEnabled", out var pAutoStart))
+                {
+                    _autoStartEnabled = pAutoStart.GetBoolean();
+                    SyncAutoStartRegistry(_autoStartEnabled, logQuiet: true);
+                }
                 if (r.TryGetProperty("miniModeType", out var p4))
                 {
                     string? v = p4.GetString();
@@ -3170,9 +3563,12 @@ namespace CLIProxyAPI_GUI
                 }
 
                 SaveSettings();
+                TxtAutoRefreshInterval.Text = _autoRefreshIntervalMinutes.ToString();
                 ApplyTheme();
                 UpdateThemeSegmentedUI();
                 UpdateMaskAccountSegmentUI();
+                UpdateAutoStartSegmentUI();
+                UpdateWarmupSegmentUI();
                 ResetAutoRefreshTimer();
                 UpdateAutoCheckUpdateUI();
                 ApplyMiniWidgetSettings();
@@ -3640,6 +4036,92 @@ namespace CLIProxyAPI_GUI
                 BtnMaskAccountOn.Style = _maskAccountInfo ? active : inactive;
             }
             catch { }
+        }
+
+        // =================== 开机自启动设置 ===================
+
+        private static string GetExecutablePath()
+        {
+            string? path = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
+            {
+                return path;
+            }
+            return System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Haodo.exe");
+        }
+
+        private void SyncAutoStartRegistry(bool enable, bool logQuiet = false)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunRegistryKey, true);
+                if (key != null)
+                {
+                    if (enable)
+                    {
+                        string exePath = GetExecutablePath();
+                        string runCmd = $"\"{exePath}\" --autostart";
+                        var currentVal = key.GetValue(AppRegistryName) as string;
+                        if (!string.Equals(currentVal, runCmd, StringComparison.OrdinalIgnoreCase))
+                        {
+                            key.SetValue(AppRegistryName, runCmd);
+                            if (!logQuiet) Log($"[开机自启] 已写入注册表启动项: {runCmd}");
+                        }
+                    }
+                    else
+                    {
+                        if (key.GetValue(AppRegistryName) != null)
+                        {
+                            key.DeleteValue(AppRegistryName, false);
+                            if (!logQuiet) Log("[开机自启] 已从注册表移除启动项");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[开机自启] 注册表同步失败: {ex.Message}");
+            }
+        }
+
+        private void SetAutoStart(bool enabled)
+        {
+            try
+            {
+                _autoStartEnabled = enabled;
+                SyncAutoStartRegistry(enabled, logQuiet: false);
+                SaveSettings();
+                UpdateAutoStartSegmentUI();
+                Log($"[设置] 开机自启动: {(enabled ? "已开启" : "已关闭")}");
+            }
+            catch (Exception ex)
+            {
+                Log($"[设置] 设置开机自启动失败: {ex.Message}");
+            }
+        }
+
+        private void UpdateAutoStartSegmentUI()
+        {
+            try
+            {
+                var active = (Style)FindResource("BtnSegmentActive");
+                var inactive = (Style)FindResource("BtnSegmentInactive");
+                if (BtnAutoStartOff != null)
+                    BtnAutoStartOff.Style = !_autoStartEnabled ? active : inactive;
+                if (BtnAutoStartOn != null)
+                    BtnAutoStartOn.Style = _autoStartEnabled ? active : inactive;
+            }
+            catch { }
+        }
+
+        private void BtnAutoStartOff_Click(object sender, RoutedEventArgs e)
+        {
+            SetAutoStart(false);
+        }
+
+        private void BtnAutoStartOn_Click(object sender, RoutedEventArgs e)
+        {
+            SetAutoStart(true);
         }
 
         // =================== 本地 API 代理服务器 (Local Proxy Server) ===================
@@ -4513,9 +4995,9 @@ namespace CLIProxyAPI_GUI
 
         // =================== Quota Fetching (Antigravity / Gemini) ===================
 
-        private async Task<((int percent, string time) g5h, (int percent, string time) gWeek, (int percent, string time) c5h, (int percent, string time) cWeek)> FetchRealTimeQuotaAsync(AccountInfo acc)
+        private async Task<((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek, (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek)> FetchRealTimeQuotaAsync(AccountInfo acc)
         {
-            var fallback = ((0, "无数据"), (0, "无数据"), (0, "无数据"), (0, "无数据"));
+            var fallback = ((0, "无数据", (DateTime?)null), (0, "无数据", (DateTime?)null), (0, "无数据", (DateTime?)null), (0, "无数据", (DateTime?)null));
             try
             {
                 if (!File.Exists(acc.FilePath)) return fallback;
@@ -4592,7 +5074,7 @@ namespace CLIProxyAPI_GUI
 
 
 
-        private static bool IsQuotaResultValid(((int percent, string time) g5h, (int percent, string time) gWeek, (int percent, string time) c5h, (int percent, string time) cWeek) res)
+        private static bool IsQuotaResultValid(((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek, (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek) res)
         {
             return !string.Equals(res.g5h.time, "无数据", StringComparison.Ordinal) ||
                    !string.Equals(res.c5h.time, "无数据", StringComparison.Ordinal) ||
@@ -4649,9 +5131,9 @@ namespace CLIProxyAPI_GUI
             return null;
         }
 
-        private async Task<((int percent, string time) g5h, (int percent, string time) gWeek, (int percent, string time) c5h, (int percent, string time) cWeek)> FetchAntigravityQuotaAsync(string accessToken, string projectId)
+        private async Task<((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek, (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek)> FetchAntigravityQuotaAsync(string accessToken, string projectId)
         {
-            var fallback = ((0, "无数据"), (0, "无数据"), (0, "无数据"), (0, "无数据"));
+            var fallback = ((0, "无数据", (DateTime?)null), (0, "无数据", (DateTime?)null), (0, "无数据", (DateTime?)null), (0, "无数据", (DateTime?)null));
             if (string.IsNullOrEmpty(projectId)) return fallback;
 
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
@@ -4672,10 +5154,10 @@ namespace CLIProxyAPI_GUI
             string respJson = await resp.Content.ReadAsStringAsync();
             using var quotaDoc = JsonDocument.Parse(respJson);
 
-            (int percent, string time) g5h = (0, "无数据");
-            (int percent, string time) gWeek = (0, "无数据");
-            (int percent, string time) c5h = (0, "无数据");
-            (int percent, string time) cWeek = (0, "无数据");
+            (int percent, string time, DateTime? resetUtc) g5h = (0, "无数据", null);
+            (int percent, string time, DateTime? resetUtc) gWeek = (0, "无数据", null);
+            (int percent, string time, DateTime? resetUtc) c5h = (0, "无数据", null);
+            (int percent, string time, DateTime? resetUtc) cWeek = (0, "无数据", null);
 
             if (quotaDoc.RootElement.TryGetProperty("groups", out var groupsArr) && groupsArr.ValueKind == JsonValueKind.Array)
             {
@@ -4696,7 +5178,12 @@ namespace CLIProxyAPI_GUI
                             double remFrac = b.TryGetProperty("remainingFraction", out var pFrac) ? pFrac.GetDouble() : 0.0;
                             int remPercent = (int)Math.Round(remFrac * 100.0);
                             string resetTimeStr = b.TryGetProperty("resetTime", out var pReset) ? pReset.GetString() ?? "" : "";
-                            string formattedTime = FormatResetTime(resetTimeStr);
+                            DateTime? bResetUtc = null;
+                            if (!string.IsNullOrEmpty(resetTimeStr) && DateTime.TryParse(resetTimeStr, out DateTime pDt))
+                            {
+                                bResetUtc = pDt.ToUniversalTime();
+                            }
+                            string formattedTime = FormatResetTime(bResetUtc);
 
                             bool is5h = bId.Contains("5h", StringComparison.OrdinalIgnoreCase) ||
                                         bId.Contains("hour", StringComparison.OrdinalIgnoreCase) ||
@@ -4710,17 +5197,17 @@ namespace CLIProxyAPI_GUI
 
                             if (isGeminiGroup || bId.Contains("gemini", StringComparison.OrdinalIgnoreCase))
                             {
-                                if (is5h) g5h = (remPercent, formattedTime);
-                                else if (isWeekly) gWeek = (remPercent, formattedTime);
-                                else if (g5h.percent == 0 && string.Equals(g5h.time, "无数据", StringComparison.Ordinal)) g5h = (remPercent, formattedTime);
-                                else if (gWeek.percent == 0 && string.Equals(gWeek.time, "无数据", StringComparison.Ordinal)) gWeek = (remPercent, formattedTime);
+                                if (is5h) g5h = (remPercent, formattedTime, bResetUtc);
+                                else if (isWeekly) gWeek = (remPercent, formattedTime, bResetUtc);
+                                else if (g5h.percent == 0 && string.Equals(g5h.time, "无数据", StringComparison.Ordinal)) g5h = (remPercent, formattedTime, bResetUtc);
+                                else if (gWeek.percent == 0 && string.Equals(gWeek.time, "无数据", StringComparison.Ordinal)) gWeek = (remPercent, formattedTime, bResetUtc);
                             }
                             else
                             {
-                                if (is5h) c5h = (remPercent, formattedTime);
-                                else if (isWeekly) cWeek = (remPercent, formattedTime);
-                                else if (c5h.percent == 0 && string.Equals(c5h.time, "无数据", StringComparison.Ordinal)) c5h = (remPercent, formattedTime);
-                                else if (cWeek.percent == 0 && string.Equals(cWeek.time, "无数据", StringComparison.Ordinal)) cWeek = (remPercent, formattedTime);
+                                if (is5h) c5h = (remPercent, formattedTime, bResetUtc);
+                                else if (isWeekly) cWeek = (remPercent, formattedTime, bResetUtc);
+                                else if (c5h.percent == 0 && string.Equals(c5h.time, "无数据", StringComparison.Ordinal)) c5h = (remPercent, formattedTime, bResetUtc);
+                                else if (cWeek.percent == 0 && string.Equals(cWeek.time, "无数据", StringComparison.Ordinal)) cWeek = (remPercent, formattedTime, bResetUtc);
                             }
                         }
                     }
@@ -4736,17 +5223,27 @@ namespace CLIProxyAPI_GUI
             return (g5h, gWeek, c5h, cWeek);
         }
 
+        private static string FormatResetTime(DateTime? resetUtc)
+        {
+            if (!resetUtc.HasValue) return "无数据";
+            TimeSpan diff = resetUtc.Value - DateTime.UtcNow;
+            if (diff.TotalSeconds <= 0) return "已刷新";
+            if (diff.TotalDays >= 1)
+                return $"{(int)diff.TotalDays} 天 {diff.Hours} 小时 {diff.Minutes} 分 {diff.Seconds:D2} 秒 后刷新";
+            else if (diff.TotalHours >= 1)
+                return $"{(int)diff.TotalHours} 小时 {diff.Minutes} 分 {diff.Seconds:D2} 秒 后刷新";
+            else if (diff.TotalMinutes >= 1)
+                return $"{diff.Minutes} 分 {diff.Seconds:D2} 秒 后刷新";
+            else
+                return $"{diff.Seconds} 秒 后刷新";
+        }
+
         private static string FormatResetTime(string resetTimeUtcStr)
         {
             if (string.IsNullOrEmpty(resetTimeUtcStr)) return "无数据";
             if (DateTime.TryParse(resetTimeUtcStr, out DateTime resetDt))
             {
-                TimeSpan diff = resetDt.ToUniversalTime() - DateTime.UtcNow;
-                if (diff.TotalSeconds <= 0) return "已刷新";
-                if (diff.TotalDays >= 1)
-                    return $"{(int)diff.TotalDays} 天 {diff.Hours} 小时 后刷新";
-                else
-                    return $"{(int)diff.TotalHours} 小时 {diff.Minutes} 分钟 后刷新";
+                return FormatResetTime(resetDt.ToUniversalTime());
             }
             return "计算中";
         }
@@ -4856,6 +5353,7 @@ namespace CLIProxyAPI_GUI
         {
             try
             {
+                _countdownTextBlocks.Clear();
                 QuotaAccountsContainer.Children.Clear();
                 if (_cachedQuotas.Count == 0) return;
 
@@ -4984,12 +5482,141 @@ namespace CLIProxyAPI_GUI
             catch { }
         }
 
+        // 账号卡片右键菜单：单账号操作（严格统一设计规范）
+        private void AttachAccountCardContextMenu(Border card, AccountInfo acc)
+        {
+            try
+            {
+                var menu = new ContextMenu();
+                if (TryFindResource("AccountCardContextMenu") is Style menuStyle)
+                {
+                    menu.Style = menuStyle;
+                }
+
+                Style? itemStyle = TryFindResource("AccountCardMenuItem") is Style s ? s : null;
+                Style? sepStyle = TryFindResource("AccountCardMenuSeparator") is Style sep ? sep : null;
+
+                // 1. 刷新账号
+                var refreshItem = new MenuItem { Header = "刷新账号" };
+                if (itemStyle != null) refreshItem.Style = itemStyle;
+                refreshItem.Click += async (s, e) =>
+                {
+                    await RefreshSingleAccountAsync(acc);
+                };
+                menu.Items.Add(refreshItem);
+
+                // 2. 复制邮箱
+                var copyEmailItem = new MenuItem { Header = "复制邮箱" };
+                if (itemStyle != null) copyEmailItem.Style = itemStyle;
+                copyEmailItem.Click += (s, e) =>
+                {
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(acc.Email))
+                        {
+                            Clipboard.SetText(acc.Email);
+                            Log($"[剪贴板] 已复制账号邮箱: {GetDisplayEmail(acc.Email)}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[剪贴板] 复制邮箱失败: {ex.Message}");
+                    }
+                };
+                menu.Items.Add(copyEmailItem);
+
+                // 3. 打开文件位置
+                var openLocationItem = new MenuItem { Header = "打开文件位置" };
+                if (itemStyle != null) openLocationItem.Style = itemStyle;
+                openLocationItem.Click += (s, e) =>
+                {
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(acc.FilePath) && File.Exists(acc.FilePath))
+                        {
+                            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                            {
+                                FileName = "explorer.exe",
+                                Arguments = $"/select,\"{acc.FilePath}\"",
+                                UseShellExecute = true
+                            });
+                        }
+                        else if (Directory.Exists(_dataDir))
+                        {
+                            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                            {
+                                FileName = "explorer.exe",
+                                Arguments = $"\"{_dataDir}\"",
+                                UseShellExecute = true
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[资源管理器] 打开位置失败: {ex.Message}");
+                    }
+                };
+                menu.Items.Add(openLocationItem);
+
+                card.ContextMenu = menu;
+            }
+            catch { }
+        }
+
+        private async Task RefreshSingleAccountAsync(AccountInfo acc)
+        {
+            try
+            {
+                Log($"[配额] 正在单独刷新账号: {GetDisplayEmail(acc.Email)}...");
+
+                // 找到对应卡片进行视觉反馈（半透明），提示正在刷新
+                Border? targetCard = QuotaAccountsContainer.Children.OfType<Border>()
+                    .FirstOrDefault(b => string.Equals(b.Tag as string, acc.FilePath, StringComparison.OrdinalIgnoreCase));
+
+                if (targetCard != null)
+                {
+                    targetCard.Opacity = 0.55;
+                }
+
+                var newQuota = await FetchRealTimeQuotaAsync(acc);
+                if (IsQuotaResultValid(newQuota))
+                {
+                    _lastGoodQuotas[acc.FilePath] = newQuota;
+                }
+                else if (_lastGoodQuotas.TryGetValue(acc.FilePath, out var lastGood) && IsQuotaResultValid(lastGood))
+                {
+                    Log($"[降级] {GetDisplayEmail(acc.Email)} 本次查询失败，显示上次成功数据");
+                    newQuota = lastGood;
+                }
+
+                int idx = _cachedQuotas.FindIndex(q => string.Equals(q.acc.FilePath, acc.FilePath, StringComparison.OrdinalIgnoreCase));
+                if (idx >= 0)
+                {
+                    _cachedQuotas[idx] = (acc, newQuota);
+                }
+                else
+                {
+                    _cachedQuotas.Add((acc, newQuota));
+                }
+
+                RefreshAccountsUIOnly();
+                UpdateMiniWidgetData();
+                Log($"[配额] 账号 {GetDisplayEmail(acc.Email)} 刷新完成: 5h {newQuota.g5h.percent}% | 周 {newQuota.gWeek.percent}%");
+            }
+            catch (Exception ex)
+            {
+                Log($"[错误] 刷新账号 {GetDisplayEmail(acc.Email)} 失败: {ex.Message}");
+                RefreshAccountsUIOnly();
+            }
+        }
+
         private async void RefreshAccounts()
         {
             try
             {
                 BtnRefreshQuota.IsEnabled = false;
                 TxtRefreshBtn.Text = "⏳ 查询中...";
+                _countdownTextBlocks.Clear();
                 QuotaAccountsContainer.Children.Clear();
 
                 var accounts = LoadAllAccounts();
@@ -5047,7 +5674,8 @@ namespace CLIProxyAPI_GUI
                                 Opacity = 0.06
                             }
                         };
-                        AttachCardHoverFeedback(accountCard);
+                    AttachCardHoverFeedback(accountCard);
+                    AttachAccountCardContextMenu(accountCard, acc);
 
                         StackPanel cardStack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Stretch };
 
@@ -5129,6 +5757,13 @@ namespace CLIProxyAPI_GUI
 
                 Log($"[完成] 配额查询结束。");
                 UpdateMiniWidgetData();
+
+                // 若定时预热处于有效期内，逐一检查满额/未唤醒账号并进行定向极简握手
+                if (IsWarmupActive())
+                {
+                    TxtRefreshBtn.Text = "🔥 预热握手中...";
+                    await CheckAndRunScheduledWarmupAsync();
+                }
             }
             catch (Exception ex)
             {
@@ -5141,6 +5776,378 @@ namespace CLIProxyAPI_GUI
             }
         }
 
+        // =================== 定时预热核心握手与满额检测 ===================
+
+        private static readonly string[] GeminiWarmupCandidates = new[]
+        {
+            "gemini-3.5-flash-low",
+            "gemini-3.6-flash-high",
+            "gemini-2.5-flash"
+        };
+
+        private static readonly string[] ClaudeWarmupCandidates = new[]
+        {
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6"
+        };
+
+        private (bool needWarmup, string reason) NeedsWarmup((int percent, string time, DateTime? resetUtc) quota5h, string filePath, string modelGroup)
+        {
+            // 1. 若数据无效或为 0%，且无倒计时，不唤醒
+            if (quota5h.percent <= 0 && string.Equals(quota5h.time, "无数据", StringComparison.OrdinalIgnoreCase))
+                return (false, "无配额数据");
+
+            // 2. 配额不满 100%（使用中）：绝不预热，避免干扰用户正常使用或消耗正在使用的宝贵额度
+            if (quota5h.percent < 100)
+                return (false, $"配额使用中 (剩余 {quota5h.percent}%)");
+
+            // 3. 检查真实 UTC 倒计时是否已经自然到期（<= 0 秒，卡片显示“已刷新”或剩余 0 秒）：
+            //    一旦到期，立即触发唤醒开启新 5 小时滑动窗口（优先于 _lastWarmupTimestamps 冷却限制）
+            if (quota5h.resetUtc.HasValue && (quota5h.resetUtc.Value - DateTime.UtcNow).TotalSeconds <= 0)
+            {
+                return (true, "倒计时已自然到期 (已刷新)");
+            }
+
+            // 4. 检查距上次本应用预热成功时间：若在 5 小时保护期内，说明滑动窗口已成功激活锁定，绝不重复握手
+            string warmupKey = $"{filePath}:{modelGroup}";
+            if (_lastWarmupTimestamps.TryGetValue(warmupKey, out DateTime lastWarmupTime))
+            {
+                var elapsed = DateTime.UtcNow - lastWarmupTime;
+                if (elapsed.TotalHours < 5.0)
+                {
+                    int remMinutes = (int)(TimeSpan.FromHours(5) - elapsed).TotalMinutes;
+                    return (false, $"在5h预热保护期内 (剩余约 {remMinutes} 分钟)");
+                }
+            }
+
+            // 5. 配额满额 100%：检查真实 UTC 倒计时状态
+            if (quota5h.resetUtc.HasValue)
+            {
+                TimeSpan diff = quota5h.resetUtc.Value - DateTime.UtcNow;
+
+                // 倒计时正在活跃计时（> 0 秒且 < 4 小时 45 分钟）：
+                // 说明已有真实倒计时正在递减（例如用户之前手动调用或之前已被唤醒），切勿重复预热
+                if (diff.TotalMinutes < 285)
+                {
+                    return (false, $"处于活跃倒计时中 (剩余 {FormatResetTime(quota5h.resetUtc)})");
+                }
+
+                // 属于 100% 满额且倒计时在 4 小时 45 分钟以上（Google 冷态未激活时每次查询都会动态返回「查询时刻 + 5h」浮动倒计时）：
+                // 需要触发定向直连握手将其固定激活锁定
+                return (true, $"100%满额冷态 (浮动倒计时 {FormatResetTime(quota5h.resetUtc)}，需激活锁定)");
+            }
+
+            // 6. 若无 resetUtc：状态为“已刷新”或“无数据”等冷态，需要握手激活
+            if (string.Equals(quota5h.time, "已刷新", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(quota5h.time, "无数据", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrEmpty(quota5h.time))
+            {
+                return (true, "满额冷态无倒计时");
+            }
+
+            return (false, "无需预热");
+        }
+
+        private async Task CheckAndRunScheduledWarmupAsync()
+        {
+            if (!IsWarmupActive()) return;
+            if (_isWarmingUp) return;
+
+            _isWarmingUp = true;
+            try
+            {
+                var accountsToWarm = _cachedQuotas.Where(q => !q.acc.Disabled).ToList();
+                if (accountsToWarm.Count == 0) return;
+
+                SetWarmupStatus($"正在扫描 {accountsToWarm.Count} 个账号配额...", "#3B82F6");
+                Log($"[定时预热] 正在扫描 {accountsToWarm.Count} 个账号的 5h 配额唤醒状态 (Gemini 与 Claude 完全独立判定)...");
+                bool anyWarmed = false;
+                int totalSent = 0;
+                int successSent = 0;
+                var scanSw = Stopwatch.StartNew();
+
+                foreach (var item in accountsToWarm)
+                {
+                    if (!IsWarmupActive())
+                    {
+                        Log("[定时预热] 定时预热已关闭，终止本次预热扫描");
+                        AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] 预热已关闭，本次扫描终止。");
+                        SetWarmupStatus("定时预热已关闭", "#94A3B8");
+                        break;
+                    }
+
+                    var acc = item.acc;
+                    var quota = item.quota;
+
+                    // Gemini 与 Claude/Opus 拥有独立配额桶（gemini-5h 与 3p-5h），完全独立判定，互不影响
+                    var (needGemini, geminiReason) = NeedsWarmup(quota.g5h, acc.FilePath, "gemini");
+                    var (needClaude, claudeReason) = NeedsWarmup(quota.c5h, acc.FilePath, "claude");
+
+                    if (!needGemini && !needClaude)
+                    {
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} - Gemini: {geminiReason} | Claude: {claudeReason}");
+                        continue;
+                    }
+
+                    anyWarmed = true;
+                    bool accountWarmed = false;
+
+                    // 1. Gemini 分组定向唤醒与候选轮退
+                    if (needGemini)
+                    {
+                        totalSent++;
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} Gemini 5h 符合唤醒条件: {geminiReason}，开始定向直连握手...");
+                        var (ok, usedModel, ms, err) = await WarmupAccountGroupDirectAsync(acc, GeminiWarmupCandidates, "Gemini");
+                        if (ok)
+                        {
+                            _lastWarmupTimestamps[$"{acc.FilePath}:gemini"] = DateTime.UtcNow;
+                            successSent++;
+                            accountWarmed = true;
+                            AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] {GetDisplayEmail(acc.Email)} | Gemini分组 | 模型: {usedModel} | 状态: 握手成功 (HTTP 200, {ms}ms)");
+                        }
+                        else
+                        {
+                            AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] {GetDisplayEmail(acc.Email)} | Gemini分组 | 状态: 握手失败 - {err}");
+                        }
+                        await Task.Delay(Random.Shared.Next(300, 500));
+                    }
+                    else
+                    {
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} Gemini 5h 跳过预热: {geminiReason}");
+                    }
+
+                    // 2. Claude/Opus 分组定向唤醒与候选轮退（完全独立，不因 Gemini 结果而跳过）
+                    if (needClaude)
+                    {
+                        totalSent++;
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} Claude 5h 符合唤醒条件: {claudeReason}，开始定向直连握手...");
+                        var (ok, usedModel, ms, err) = await WarmupAccountGroupDirectAsync(acc, ClaudeWarmupCandidates, "Claude");
+                        if (ok)
+                        {
+                            _lastWarmupTimestamps[$"{acc.FilePath}:claude"] = DateTime.UtcNow;
+                            successSent++;
+                            accountWarmed = true;
+                            AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] {GetDisplayEmail(acc.Email)} | Claude分组 | 模型: {usedModel} | 状态: 握手成功 (HTTP 200, {ms}ms)");
+                        }
+                        else
+                        {
+                            AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] {GetDisplayEmail(acc.Email)} | Claude分组 | 状态: 握手失败 - {err}");
+                        }
+                        await Task.Delay(Random.Shared.Next(300, 500));
+                    }
+                    else
+                    {
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} Claude 5h 跳过预热: {claudeReason}");
+                    }
+
+                    if (accountWarmed)
+                    {
+                        // 握手完成后重新拉取该账号最新真实配额，更新卡片倒计时展示
+                        var refreshedQuota = await FetchRealTimeQuotaAsync(acc);
+                        if (IsQuotaResultValid(refreshedQuota))
+                        {
+                            _lastGoodQuotas[acc.FilePath] = refreshedQuota;
+                            int idx = _cachedQuotas.FindIndex(q => string.Equals(q.acc.FilePath, acc.FilePath, StringComparison.OrdinalIgnoreCase));
+                            if (idx >= 0)
+                            {
+                                _cachedQuotas[idx] = (acc, refreshedQuota);
+                            }
+                            RefreshAccountsUIOnly();
+                            UpdateMiniWidgetData();
+                            Log($"[定时预热] {GetDisplayEmail(acc.Email)} 唤醒完成，最新倒计时：Gemini ({refreshedQuota.g5h.time}) | Claude ({refreshedQuota.c5h.time})");
+                        }
+                    }
+
+                    // 账号间保持 500ms~800ms 微小间隔
+                    await Task.Delay(Random.Shared.Next(500, 801));
+                }
+
+                scanSw.Stop();
+
+                if (anyWarmed)
+                {
+                    Log($"[定时预热] 本轮定向唤醒扫描已完成 (成功 {successSent}/{totalSent})，耗时 {scanSw.ElapsedMilliseconds}ms。");
+                    if (successSent == totalSent)
+                    {
+                        SetWarmupStatus($"最近预热: {DateTime.Now:HH:mm:ss} | 全部握手成功 ({successSent}/{totalSent}) | 耗时 {scanSw.ElapsedMilliseconds}ms", "#16A34A");
+                    }
+                    else
+                    {
+                        SetWarmupStatus($"最近预热: {DateTime.Now:HH:mm:ss} | 部分完成 ({successSent}/{totalSent} 成功) | 耗时 {scanSw.ElapsedMilliseconds}ms", "#F59E0B");
+                    }
+                }
+                else
+                {
+                    Log("[定时预热] 所有账号 5h 配额均处于倒计时中或使用中，无需唤醒。");
+                    SetWarmupStatus($"最近检测: {DateTime.Now:HH:mm:ss} | 配额无需唤醒 ({accountsToWarm.Count} 个账号正常)", "#16A34A");
+                    AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] 定时检测: 扫描 {accountsToWarm.Count} 个账号，所有分组均在倒计时中或使用中，未触发唤醒。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[定时预热] 异常: {ex.Message}");
+                SetWarmupStatus($"预热扫描异常: {ex.Message}", "#EF4444");
+                AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] 预热扫描异常: {ex.Message}");
+            }
+            finally
+            {
+                _isWarmingUp = false;
+            }
+        }
+
+        private async Task<(bool success, string usedModel, long elapsedMs, string error)> WarmupAccountGroupDirectAsync(AccountInfo acc, string[] candidateModels, string groupName)
+        {
+            string displayEmail = GetDisplayEmail(acc.Email);
+            try
+            {
+                if (!File.Exists(acc.FilePath))
+                {
+                    return (false, "", 0, "凭据文件不存在");
+                }
+
+                string accessToken = "";
+                string refreshToken = "";
+                string projectId = acc.ProjectId;
+
+                using (var doc = JsonDocument.Parse(File.ReadAllText(acc.FilePath)))
+                {
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("access_token", out var pTok)) accessToken = pTok.GetString() ?? "";
+                    if (root.TryGetProperty("refresh_token", out var pRef)) refreshToken = pRef.GetString() ?? "";
+                    if (string.IsNullOrEmpty(projectId) && root.TryGetProperty("project_id", out var pProj))
+                        projectId = pProj.GetString() ?? "";
+                }
+
+                if (string.IsNullOrEmpty(accessToken) && !string.IsNullOrEmpty(refreshToken))
+                {
+                    accessToken = await RefreshAntigravityTokenAsync(refreshToken) ?? "";
+                    if (!string.IsNullOrEmpty(accessToken))
+                    {
+                        UpdateJsonToken(acc.FilePath, accessToken);
+                    }
+                }
+
+                if (string.IsNullOrEmpty(accessToken))
+                {
+                    Log($"[定时预热] {displayEmail} 缺少 access_token，跳过 {groupName} 预热");
+                    return (false, "", 0, "缺少有效 access_token");
+                }
+
+                string lastErr = "";
+                long lastMs = 0;
+
+                // 候选模型轮退尝试：若首选模型不可用 (HTTP 404/400)，自动平滑降级至备选模型
+                for (int i = 0; i < candidateModels.Length; i++)
+                {
+                    string modelName = candidateModels[i];
+                    var (ok, elapsedMs, statusCode, err) = await SendDirectWarmupRequestAsync(acc.FilePath, acc.Email, accessToken, refreshToken, projectId, modelName);
+                    lastMs = elapsedMs;
+                    lastErr = err;
+
+                    if (ok)
+                    {
+                        Log($"[定时预热] {displayEmail} - [{groupName}] 采用模型 {modelName} 握手成功 (HTTP 200, {elapsedMs}ms)");
+                        return (true, modelName, elapsedMs, "");
+                    }
+
+                    Log($"[定时预热] {displayEmail} - [{groupName}] 模型 {modelName} 响应 HTTP {statusCode} ({elapsedMs}ms): {err}");
+                    if (i < candidateModels.Length - 1)
+                    {
+                        Log($"[定时预热] {displayEmail} - [{groupName}] 尝试备选模型: {candidateModels[i + 1]}...");
+                        await Task.Delay(200);
+                    }
+                }
+
+                return (false, "", lastMs, lastErr);
+            }
+            catch (Exception ex)
+            {
+                Log($"[定时预热] {displayEmail} [{groupName}] 异常: {ex.Message}");
+                return (false, "", 0, ex.Message);
+            }
+        }
+
+        private async Task<(bool success, long elapsedMs, int statusCode, string error)> SendDirectWarmupRequestAsync(string filePath, string email, string accessToken, string refreshToken, string projectId, string modelName)
+        {
+            var innerRequest = new Dictionary<string, object>
+            {
+                ["sessionId"] = "-" + Math.Abs(Random.Shared.NextInt64(1000000000000000L, 9999999999999999L)),
+                ["contents"] = new object[]
+                {
+                    new { role = "user", parts = new object[] { new { text = "hi" } } }
+                },
+                ["generationConfig"] = new Dictionary<string, object>
+                {
+                    ["maxOutputTokens"] = 1
+                }
+            };
+
+            var outerWrapper = new Dictionary<string, object>
+            {
+                ["model"] = modelName,
+                ["userAgent"] = "antigravity",
+                ["requestType"] = "agent",
+                ["requestId"] = "agent-" + Guid.NewGuid().ToString("D"),
+                ["request"] = innerRequest
+            };
+
+            if (!string.IsNullOrWhiteSpace(projectId))
+            {
+                outerWrapper["project"] = projectId;
+            }
+
+            string jsonBody = JsonSerializer.Serialize(outerWrapper);
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+
+            async Task<HttpResponseMessage> SendRequestWithToken(string token)
+            {
+                var req = new HttpRequestMessage(HttpMethod.Post, LocalProxyServer.GoogleCloudCodeBaseUrl + "/v1internal:generateContent");
+                req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+                req.Headers.TryAddWithoutValidation("User-Agent", LocalProxyServer.AntigravityUserAgent);
+                req.Content = new StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
+                return await client.SendAsync(req);
+            }
+
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                var resp = await SendRequestWithToken(accessToken);
+
+                // 若返回 401 凭据失效，尝试使用 refresh_token 刷新后重试一次
+                if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized && !string.IsNullOrEmpty(refreshToken))
+                {
+                    resp.Dispose();
+                    string? newToken = await RefreshAntigravityTokenAsync(refreshToken);
+                    if (!string.IsNullOrEmpty(newToken))
+                    {
+                        UpdateJsonToken(filePath, newToken);
+                        resp = await SendRequestWithToken(newToken);
+                    }
+                }
+
+                sw.Stop();
+                long ms = sw.ElapsedMilliseconds;
+
+                using (resp)
+                {
+                    int code = (int)resp.StatusCode;
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        return (true, ms, code, "");
+                    }
+
+                    string err = await resp.Content.ReadAsStringAsync();
+                    string shortErr = TruncateText(err, 80);
+                    return (false, ms, code, shortErr);
+                }
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                return (false, sw.ElapsedMilliseconds, 0, ex.Message);
+            }
+        }
+
         private void BtnSwitchToMini_Click(object sender, RoutedEventArgs e)
         {
             SwitchToMiniMode();
@@ -5148,7 +6155,7 @@ namespace CLIProxyAPI_GUI
 
         // =================== UI Helper Methods ===================
 
-        private StackPanel CreateGroupSection(string groupTitle, (int percent, string time) fiveHourQuota, (int percent, string time) weekQuota)
+        private StackPanel CreateGroupSection(string groupTitle, (int percent, string time, DateTime? resetUtc) fiveHourQuota, (int percent, string time, DateTime? resetUtc) weekQuota)
         {
             StackPanel groupStack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Stretch };
             groupStack.Children.Add(new TextBlock
@@ -5165,14 +6172,14 @@ namespace CLIProxyAPI_GUI
             // 5h quota bar
             string label1 = _compactMode ? "5h 限额" : "5 小时限额";
             string label2 = _compactMode ? "周限额" : "周限额";
-            groupStack.Children.Add(CreateQuotaBar(label1, fiveHourQuota.percent, fiveHourQuota.time, bar1Color));
+            groupStack.Children.Add(CreateQuotaBar(label1, fiveHourQuota.percent, fiveHourQuota.time, fiveHourQuota.resetUtc, bar1Color));
             // Weekly quota bar
-            groupStack.Children.Add(CreateQuotaBar(label2, weekQuota.percent, weekQuota.time, bar2Color, isMarginTop: true));
+            groupStack.Children.Add(CreateQuotaBar(label2, weekQuota.percent, weekQuota.time, weekQuota.resetUtc, bar2Color, isMarginTop: true));
 
             return groupStack;
         }
 
-        private StackPanel CreateQuotaBar(string label, int percent, string refreshTime, string barColor, bool isMarginTop = false)
+        private StackPanel CreateQuotaBar(string label, int percent, string refreshTime, DateTime? resetUtc, string barColor, bool isMarginTop = false)
         {
             Thickness cardMargin = isMarginTop
                 ? (_compactMode ? new Thickness(0, 6, 0, 0) : new Thickness(0, 10, 0, 0))
@@ -5205,8 +6212,13 @@ namespace CLIProxyAPI_GUI
                 Text = refreshTime, FontSize = _compactMode ? 10 : 11,
                 FontFamily = new FontFamily("Cascadia Code, Consolas, Segoe UI"),
                 Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(_tcTextTertiary)),
-                VerticalAlignment = VerticalAlignment.Center
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = resetUtc
             };
+            if (resetUtc.HasValue)
+            {
+                _countdownTextBlocks.Add(txtTime);
+            }
             Grid.SetColumn(txtTime, 1);
             line1.Children.Add(txtTime);
             card.Children.Add(line1);

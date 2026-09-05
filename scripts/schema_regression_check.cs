@@ -7,9 +7,16 @@ class Probe
 {
     static int Main()
     {
-        string dll = @"E:\onedrive-lin\OneDrive\编程\BalanceViewer\src\bin\Debug\net10.0-windows\win-x64\Haodo.dll";
+        string scriptDir = AppDomain.CurrentDomain.BaseDirectory;
+        string rootDir = System.IO.Directory.GetCurrentDirectory();
+        string[] searchPaths = new[] {
+            System.IO.Path.Combine(rootDir, "src", "bin", "Release", "net10.0-windows", "win-x64", "Haodo.dll"),
+            System.IO.Path.Combine(rootDir, "src", "bin", "Debug", "net10.0-windows", "win-x64", "Haodo.dll"),
+            System.IO.Path.Combine(rootDir, "Haodo.dll")
+        };
+        string dll = searchPaths.FirstOrDefault(p => System.IO.File.Exists(p)) ?? searchPaths[0];
         var asm = Assembly.LoadFrom(dll);
-        Type type = asm.GetType("BalanceViewer.GeminiProtocolTranslator");
+        Type type = asm.GetType("CLIProxyAPI_GUI.GeminiProtocolTranslator") ?? asm.GetType("BalanceViewer.GeminiProtocolTranslator");
         if (type == null)
         {
             try

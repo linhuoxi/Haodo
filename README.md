@@ -52,7 +52,6 @@
 
 - **操作系统**: Windows 10 (1809+) / Windows 11 (x64)
 - **开发环境**: [.NET 10.0 Desktop SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
-- **可选依赖**: Python 3.x（仅用于使用混淆工具时的 Win32 资源修复）
 
 ### 快速编译
 
@@ -85,10 +84,8 @@ Haodo/
 │   ├── LocalProxyServer.cs   # 本地 API 代理 HTTP 服务
 │   └── GeminiProtocolTranslator.cs # OpenAI <-> Gemini 协议双向转换器
 ├── scripts/                  # 本地构建与辅助脚本
-│   ├── build_only.ps1        # 本地单文件编译与混淆打包
-│   ├── fix_obfuscated_rsrc.py# 资源段修复工具
+│   ├── build_only.ps1        # 本地轻量单文件编译打包
 │   └── schema_regression_check.cs # Schema 白名单回归测试
-├── tools/                    # 构建辅助工具
 ├── 维护文档/                 # 架构详解与维护文档
 ├── 仅编译.bat                # 一键编译批处理入口
 ├── 版本号.txt                # 版本号定义文件

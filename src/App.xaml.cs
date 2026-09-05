@@ -133,8 +133,17 @@ namespace CLIProxyAPI_GUI
             catch { }
 
             base.OnStartup(e);
-            MainWindow window = new MainWindow();
-            window.Show();
+            bool isAutoStart = e.Args != null && Array.Exists(e.Args, a => string.Equals(a, "--autostart", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-autostart", StringComparison.OrdinalIgnoreCase));
+            MainWindow window = new MainWindow(isAutoStart);
+            if (!isAutoStart)
+            {
+                window.Show();
+            }
+            else
+            {
+                window.Show();
+                window.Hide();
+            }
         }
 
         protected override void OnExit(ExitEventArgs e)

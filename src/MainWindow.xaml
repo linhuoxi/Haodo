@@ -104,6 +104,73 @@
             </Setter>
         </Style>
 
+        <!-- 账号卡片右键菜单样式：严格统一现有设计语言（MiniContextMenu 与托盘菜单统一规范） -->
+        <Style x:Key="AccountCardContextMenu" TargetType="ContextMenu">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="HasDropShadow" Value="False"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="UseLayoutRounding" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ContextMenu">
+                        <Border Background="#161B22"
+                                BorderBrush="#2D333B"
+                                BorderThickness="1"
+                                CornerRadius="8"
+                                Padding="4"
+                                MinWidth="140"
+                                SnapsToDevicePixels="True"
+                                UseLayoutRounding="True">
+                            <Border.Effect>
+                                <DropShadowEffect BlurRadius="14" ShadowDepth="3" Opacity="0.45" Color="#000000"/>
+                            </Border.Effect>
+                            <StackPanel IsItemsHost="True" SnapsToDevicePixels="True" UseLayoutRounding="True"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="AccountCardMenuItem" TargetType="MenuItem">
+            <Setter Property="Foreground" Value="#E6EDF3"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Padding" Value="12,0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="UseLayoutRounding" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="MenuItem">
+                        <Border x:Name="bd" Background="Transparent" CornerRadius="5" SnapsToDevicePixels="True">
+                            <ContentPresenter ContentSource="Header" VerticalAlignment="Center" HorizontalAlignment="Left" Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="#3572EF33"/>
+                                <Setter Property="Foreground" Value="#FFFFFF"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#8B949E"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="AccountCardMenuSeparator" TargetType="Separator">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Separator">
+                        <Border Height="1" Background="#2D333B" Margin="6,4"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- 可编辑下拉框样式：圆角 6 + 主题配色下拉面板 + 空值占位提示（模型测试用） -->
         <Style x:Key="ComboRoundEditable" TargetType="ComboBox">
             <Setter Property="Foreground" Value="{DynamicResource ThemeTextPrimary}"/>
@@ -849,6 +916,35 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- 开机自启动 -->
+                            <Border Style="{StaticResource VergeCard}" Padding="0" HorizontalAlignment="Stretch">
+                                <StackPanel HorizontalAlignment="Stretch">
+                                    <Button Click="ToggleSettingsSection_Click" Tag="SettingsAutoStartContent|TxtArrowAutoStart" Style="{StaticResource SettingsCardHeader}">
+                                        <Grid HorizontalAlignment="Stretch">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="开机自启动" FontSize="14" FontWeight="Bold" Foreground="{DynamicResource ThemeTextPrimary}" VerticalAlignment="Center" Margin="14,11,0,11"/>
+                                            <TextBlock x:Name="TxtArrowAutoStart" Grid.Column="1" Text="▶" FontSize="10" Foreground="{DynamicResource ThemeTextTertiary}" VerticalAlignment="Center" Margin="0,0,14,0"/>
+                                        </Grid>
+                                    </Button>
+                                    <StackPanel x:Name="SettingsAutoStartContent" Visibility="Collapsed" HorizontalAlignment="Stretch" Margin="14,0,14,12">
+                                        <TextBlock Text="开机时自动在后台启动应用，并在系统托盘静默就绪。" FontSize="12" Foreground="{DynamicResource ThemeTextSecondary}" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                        <Border Background="{DynamicResource ThemeSegmentBg}" CornerRadius="8" Padding="3" HorizontalAlignment="Stretch">
+                                            <Grid HorizontalAlignment="Stretch">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Button x:Name="BtnAutoStartOff" Click="BtnAutoStartOff_Click" Content="关闭" Style="{StaticResource BtnHeader}" Margin="0,0,2,0" HorizontalAlignment="Stretch" ToolTip="开机时不自动运行"/>
+                                                <Button x:Name="BtnAutoStartOn" Grid.Column="1" Click="BtnAutoStartOn_Click" Content="开启" Style="{StaticResource BtnHeader}" Margin="2,0,0,0" HorizontalAlignment="Stretch" ToolTip="登录系统时自动启动并在托盘就绪"/>
+                                            </Grid>
+                                        </Border>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+
                             <!-- 数据目录 -->
                             <Border Style="{StaticResource VergeCard}" Padding="0" HorizontalAlignment="Stretch">
                                 <StackPanel HorizontalAlignment="Stretch">
@@ -1007,6 +1103,51 @@
                                                 </Button>
                                             </StackPanel>
                                         </Grid>
+
+                                        <!-- 分隔线 -->
+                                        <Border Height="1" Background="{DynamicResource ThemeCardBorder}" Margin="0,14,0,12"/>
+
+                                        <!-- 第二项设置：定时预热开关 -->
+                                        <Grid HorizontalAlignment="Stretch">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel VerticalAlignment="Center">
+                                                <TextBlock Text="定时预热" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource ThemeTextPrimary}"/>
+                                                <TextBlock Text="自动刷新后，若账号 5h 配额为 100%（满额）且倒计时已到期或未激活，则自动发送消息唤醒 5 小时滚动倒计时。" FontSize="10" Foreground="{DynamicResource ThemeTextTertiary}" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                            </StackPanel>
+                                            <Border Grid.Column="1" Background="{DynamicResource ThemeSegmentBg}" CornerRadius="7" Padding="3" VerticalAlignment="Center" Margin="12,0,0,0">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="44"/>
+                                                        <ColumnDefinition Width="44"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <Button x:Name="BtnWarmupOff" Click="BtnWarmupOff_Click" Content="关闭" Style="{StaticResource BtnSegmentInactive}" Height="26" Padding="5,0"/>
+                                                    <Button x:Name="BtnWarmupOn" Grid.Column="1" Click="BtnWarmupOn_Click" Content="开启" Style="{StaticResource BtnSegmentActive}" Height="26" Padding="5,0"/>
+                                                </Grid>
+                                            </Border>
+                                        </Grid>
+
+                                        <!-- 预热日志报告窗口（复用模型测试结果框结构与样式） -->
+                                        <Border Background="{DynamicResource ThemeInputBg}" BorderBrush="{DynamicResource ThemeInputBorder}" BorderThickness="1" CornerRadius="8" Padding="10,8" Margin="0,10,0,0">
+                                            <StackPanel>
+                                                <Grid Margin="0,0,0,5">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock x:Name="TxtWarmupStatus" Text="尚未执行预热" FontSize="11" FontFamily="Cascadia Mono, Consolas" Foreground="{DynamicResource ThemeTextTertiary}" VerticalAlignment="Center"/>
+                                                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                                        <Button x:Name="BtnClearWarmupLog" Click="BtnClearWarmupLog_Click" Content="清空" Style="{StaticResource BtnHeader}" FontSize="10" Padding="6,1" Height="20" Margin="0,0,4,0" ToolTip="清空预热日志"/>
+                                                        <Button x:Name="BtnCopyWarmupLog" Click="BtnCopyWarmupLog_Click" Content="复制" Style="{StaticResource BtnHeader}" FontSize="10" Padding="6,1" Height="20" ToolTip="复制预热日志内容到剪贴板"/>
+                                                    </StackPanel>
+                                                </Grid>
+                                                <ScrollViewer x:Name="ScrollWarmupLog" MaxHeight="120" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                                    <TextBox x:Name="TxtWarmupLog" IsReadOnly="True" TextWrapping="Wrap" Background="Transparent" Foreground="{DynamicResource ThemeTextSecondary}" BorderThickness="0" Padding="0" FontFamily="Cascadia Mono, Consolas" FontSize="11" Text="开启定时预热后，当账号 5h 配额满额（100%）且倒计时已到期时，在此实时记录确切发送时间、账号、模型与握手结果。"/>
+                                                </ScrollViewer>
+                                            </StackPanel>
+                                        </Border>
                                     </StackPanel>
                                 </StackPanel>
                             </Border>

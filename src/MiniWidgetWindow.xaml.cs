@@ -1070,7 +1070,7 @@ namespace CLIProxyAPI_GUI
             string logoBgHex,
             string platformName,
             string email,
-            ((int percent, string time) g5h, (int percent, string time) gWeek, (int percent, string time) c5h, (int percent, string time) cWeek) quota,
+            ((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek, (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek) quota,
             string tooltipDetails)
         {
             try
@@ -1121,7 +1121,15 @@ namespace CLIProxyAPI_GUI
                     SetBarItem(TxtLabel4, ColFill4, ColBg4, BarFill4, TxtVal4, TrackBg4, "周", quota.cWeek.percent);
 
                     ApplyCustomColorUI();
-                    this.ToolTip = $"账号: {email}\n平台: {platformName}\n{tooltipDetails}\n\n顶部拖动位置 | 下方单击切换账号 | 下方双击刷新";
+                    string tipText = $"账号: {email}\n平台: {platformName}\n{tooltipDetails}\n\n顶部拖动位置 | 下方单击切换账号 | 下方双击刷新";
+                    if (this.ToolTip is ToolTip existingTip)
+                    {
+                        existingTip.Content = tipText;
+                    }
+                    else
+                    {
+                        this.ToolTip = new ToolTip { Content = tipText };
+                    }
                 });
             }
             catch { }
