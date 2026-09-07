@@ -110,7 +110,21 @@ namespace CLIProxyAPI_GUI
         private int _countdownTickCounter = 0;
         private System.Windows.Threading.DispatcherTimer? _miniOpacitySaveTimer;
         private readonly List<TextBlock> _countdownTextBlocks = new();
-        private readonly Dictionary<string, DateTime> _lastWarmupTimestamps = new(StringComparer.OrdinalIgnoreCase);
+        // 预热判定记录（键形如 "凭证文件路径:gemini"）：全部字段都来自上游返回值或其观测时刻，软件自身不再推算任何窗口长度
+        private sealed class WarmupRecord
+        {
+            public DateTime? LastWarmupUtc;      // 上次握手成功时刻，仅用于短防抖
+            public DateTime? ObservedResetUtc;   // 上次判定所见上游 resetTime
+            public DateTime? ObservedAtUtc;      // 上次判定时刻，与上一条配对用来判 resetTime 是否随查询浮动
+            public int WakeAttempts;             // 同一冷态下已尝试唤醒的次数（上游始终无变化时用于退避）
+            public DateTime? BackoffUntilUtc;    // 未见效退避截止时刻：只限本机发请求频率，不宣称窗口长度
+        }
+        private readonly Dictionary<string, WarmupRecord> _warmupRecords = new(StringComparer.OrdinalIgnoreCase);
+        private const int WarmupDebounceSeconds = 90;
+        // 必须明显低于巡检周期（WarmupScanIntervalTicks=60 秒），否则时钟一抖就整轮被判"间隔太短"作废、判定来回晃
+        private const int WarmupMinSampleGapSeconds = 40;
+        private const int WarmupMaxSampleGapMinutes = 30;
+        private const int WarmupScanIntervalTicks = 60;
         private List<string> _jsonFilePaths = new();
         private string? _selectedAccountFile = null;
         private MiniWidgetWindow? _miniWidget = null;
@@ -1229,6 +1243,40 @@ namespace CLIProxyAPI_GUI
                                 _jsonFilePaths.Add(path);
                         }
                     }
+
+                    // 预热判定记录：取值全部来自上游返回值或其观测时刻，重启后仍需把关，故本机持久化（不参与云同步）
+                    if (doc.RootElement.TryGetProperty("warmupRecords", out var warmupObj) && warmupObj.ValueKind == JsonValueKind.Object)
+                    {
+                        DateTime staleCutoff = DateTime.UtcNow.AddDays(-7);
+                        foreach (var prop in warmupObj.EnumerateObject())
+                        {
+                            if (prop.Value.ValueKind != JsonValueKind.Object) continue;
+                            var rec = new WarmupRecord
+                            {
+                                LastWarmupUtc = ReadWarmupUtcProp(prop.Value, "lastWarmupUtc"),
+                                ObservedResetUtc = ReadWarmupUtcProp(prop.Value, "observedResetUtc"),
+                                ObservedAtUtc = ReadWarmupUtcProp(prop.Value, "observedAtUtc"),
+                                WakeAttempts = ReadWarmupIntProp(prop.Value, "wakeAttempts"),
+                                BackoffUntilUtc = ReadWarmupUtcProp(prop.Value, "backoffUntilUtc"),
+                            };
+                            // 跨重启的采样基准只在仍新鲜时才有比对意义，过期则丢弃让判定重新攒样本
+                            if (rec.ObservedAtUtc.HasValue && rec.ObservedAtUtc.Value < staleCutoff)
+                            {
+                                rec.ObservedResetUtc = null;
+                                rec.ObservedAtUtc = null;
+                            }
+                            // 退避截止时刻已到手就没必要带走，连带尝试计数一起清零
+                            if (rec.BackoffUntilUtc.HasValue && rec.BackoffUntilUtc.Value <= DateTime.UtcNow)
+                            {
+                                rec.BackoffUntilUtc = null;
+                                rec.WakeAttempts = 0;
+                            }
+                            if (!rec.LastWarmupUtc.HasValue && !rec.ObservedAtUtc.HasValue && !rec.BackoffUntilUtc.HasValue) continue;
+                            _warmupRecords[prop.Name] = rec;
+                        }
+                        if (_warmupRecords.Count > 0)
+                            Log($"[设置] 已恢复 {_warmupRecords.Count} 条预热判定记录");
+                    }
                 }
 
                 // 强制净化过滤
@@ -1276,6 +1324,7 @@ namespace CLIProxyAPI_GUI
                     localProxyPort = _localProxyPort,
                     localProxyApiKey = _localProxyApiKey,
                     dataDir = _dataDir,
+                    warmupRecords = BuildWarmupRecordsToSave(),
                     files = _jsonFilePaths
                 };
                 string json = JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true });
@@ -1286,6 +1335,52 @@ namespace CLIProxyAPI_GUI
             {
                 Log($"[警告] 保存设置失败: {ex.Message}");
             }
+        }
+
+        // 预热记录落盘前剪枝：凭证已删除的、以及握手与采样基准都过期一周的都不再保留（键含凭证绝对路径，否则会无限膨胀）
+        private Dictionary<string, object> BuildWarmupRecordsToSave()
+        {
+            var dict = new Dictionary<string, object>();
+            DateTime cutoff = DateTime.UtcNow.AddDays(-7);
+            foreach (var kv in _warmupRecords)
+            {
+                int sep = kv.Key.LastIndexOf(':');
+                string credPath = sep > 0 ? kv.Key[..sep] : kv.Key;
+                if (!_jsonFilePaths.Any(p => p.Equals(credPath, StringComparison.OrdinalIgnoreCase))) continue;
+                var rec = kv.Value;
+                bool stale = (!rec.LastWarmupUtc.HasValue || rec.LastWarmupUtc.Value < cutoff) &&
+                             (!rec.ObservedAtUtc.HasValue || rec.ObservedAtUtc.Value < cutoff) &&
+                             (!rec.BackoffUntilUtc.HasValue || rec.BackoffUntilUtc.Value <= DateTime.UtcNow);
+                if (stale) continue;
+                dict[kv.Key] = new
+                {
+                    lastWarmupUtc = rec.LastWarmupUtc?.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    observedResetUtc = rec.ObservedResetUtc?.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    observedAtUtc = rec.ObservedAtUtc?.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    wakeAttempts = rec.WakeAttempts,
+                    backoffUntilUtc = rec.BackoffUntilUtc?.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                };
+            }
+            return dict;
+        }
+
+        private static DateTime? ReadWarmupUtcProp(JsonElement obj, string name)
+        {
+            if (obj.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String)
+            {
+                string? s = p.GetString();
+                if (!string.IsNullOrEmpty(s) &&
+                    DateTime.TryParse(s, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime dt))
+                    return dt.ToUniversalTime();
+            }
+            return null;
+        }
+
+        private static int ReadWarmupIntProp(JsonElement obj, string name)
+        {
+            if (obj.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.Number && p.TryGetInt32(out int v))
+                return v;
+            return 0;
         }
 
         // =================== Compact Mode (窗口缩小 → 精简模式) ===================
@@ -1821,6 +1916,7 @@ namespace CLIProxyAPI_GUI
             _themeMode = "system";
             _maskAccountInfo = false;
             _miniWidgetColor = "#FFFFFF";
+            _warmupRecords.Clear();
         }
 
         private void MigrateAndScanDataDirectory()
@@ -2593,7 +2689,15 @@ namespace CLIProxyAPI_GUI
             for (int i = _countdownTextBlocks.Count - 1; i >= 0; i--)
             {
                 var tb = _countdownTextBlocks[i];
-                if (tb.Tag is DateTime resetUtc)
+                if (tb.Tag is ValueTuple<DateTime, int> tuple)
+                {
+                    string newText = FormatResetTime(tuple.Item1, tuple.Item2);
+                    if (tb.Text != newText)
+                    {
+                        tb.Text = newText;
+                    }
+                }
+                else if (tb.Tag is DateTime resetUtc)
                 {
                     string newText = FormatResetTime(resetUtc);
                     if (tb.Text != newText)
@@ -2613,22 +2717,22 @@ namespace CLIProxyAPI_GUI
 
                 if (g5h.resetUtc.HasValue)
                 {
-                    string nt = FormatResetTime(g5h.resetUtc);
+                    string nt = FormatResetTime(g5h.resetUtc, g5h.percent);
                     if (g5h.time != nt) { g5h = (g5h.percent, nt, g5h.resetUtc); changed = true; }
                 }
                 if (gWeek.resetUtc.HasValue)
                 {
-                    string nt = FormatResetTime(gWeek.resetUtc);
+                    string nt = FormatResetTime(gWeek.resetUtc, gWeek.percent);
                     if (gWeek.time != nt) { gWeek = (gWeek.percent, nt, gWeek.resetUtc); changed = true; }
                 }
                 if (c5h.resetUtc.HasValue)
                 {
-                    string nt = FormatResetTime(c5h.resetUtc);
+                    string nt = FormatResetTime(c5h.resetUtc, c5h.percent);
                     if (c5h.time != nt) { c5h = (c5h.percent, nt, c5h.resetUtc); changed = true; }
                 }
                 if (cWeek.resetUtc.HasValue)
                 {
-                    string nt = FormatResetTime(cWeek.resetUtc);
+                    string nt = FormatResetTime(cWeek.resetUtc, cWeek.percent);
                     if (cWeek.time != nt) { cWeek = (cWeek.percent, nt, cWeek.resetUtc); changed = true; }
                 }
 
@@ -2645,19 +2749,18 @@ namespace CLIProxyAPI_GUI
                 UpdateMiniWidgetData();
             }
 
-            // 4. 定时预热闭环：每 30 秒进行一次巡检，若有 100% 满额冷态账号或倒计时到期账号，自动触发直连握手激活
+            // 4. 定时预热闭环：按 WarmupScanIntervalTicks 秒巡检一次。这里只做廉价预筛（有满额桶才值得真查上游），
+            //    真正的唤醒判定一律在扫描内基于即时回读的上游数据完成
             _countdownTickCounter++;
-            if (_countdownTickCounter >= 30)
+            if (_countdownTickCounter >= WarmupScanIntervalTicks)
             {
                 _countdownTickCounter = 0;
                 if (IsWarmupActive() && !_isWarmingUp && _cachedQuotas.Count > 0)
                 {
-                    bool anyNeeds = _cachedQuotas.Any(q =>
-                        !q.acc.Disabled &&
-                        (NeedsWarmup(q.quota.g5h, q.acc.FilePath, "gemini").needWarmup ||
-                         NeedsWarmup(q.quota.c5h, q.acc.FilePath, "claude").needWarmup));
+                    bool anyFull = _cachedQuotas.Any(q =>
+                        !q.acc.Disabled && (q.quota.g5h.percent >= 100 || q.quota.c5h.percent >= 100));
 
-                    if (anyNeeds)
+                    if (anyFull)
                     {
                         _ = CheckAndRunScheduledWarmupAsync();
                     }
@@ -5185,6 +5288,11 @@ namespace CLIProxyAPI_GUI
                             }
                             string formattedTime = FormatResetTime(bResetUtc);
 
+                            // 原始值诊断：用于判定冷态账号上游 resetTime 是「固定到期时刻」还是「随查询浮动的假倒计时」
+                            string span = bResetUtc.HasValue
+                                ? $"剩余{(bResetUtc.Value - DateTime.UtcNow).TotalMinutes:+0.0;-0.0}分钟"
+                                : "无resetTime";
+
                             bool is5h = bId.Contains("5h", StringComparison.OrdinalIgnoreCase) ||
                                         bId.Contains("hour", StringComparison.OrdinalIgnoreCase) ||
                                         bId.Contains("primary", StringComparison.OrdinalIgnoreCase) ||
@@ -5195,7 +5303,13 @@ namespace CLIProxyAPI_GUI
                                            bId.Contains("secondary", StringComparison.OrdinalIgnoreCase) ||
                                            bId.Contains("long", StringComparison.OrdinalIgnoreCase);
 
-                            if (isGeminiGroup || bId.Contains("gemini", StringComparison.OrdinalIgnoreCase))
+                            bool toGemini = isGeminiGroup || bId.Contains("gemini", StringComparison.OrdinalIgnoreCase);
+                            string slot = toGemini
+                                ? (is5h ? "Gemini·5h" : isWeekly ? "Gemini·周" : "Gemini·未分类")
+                                : (is5h ? "Claude·5h" : isWeekly ? "Claude·周" : "Claude·未分类");
+                            Log($"[上游原始] 组\"{gName}\" bucket={bId} 剩余{remPercent}% resetTime={(string.IsNullOrEmpty(resetTimeStr) ? "无" : resetTimeStr)} ({span}) → {slot}");
+
+                            if (toGemini)
                             {
                                 if (is5h) g5h = (remPercent, formattedTime, bResetUtc);
                                 else if (isWeekly) gWeek = (remPercent, formattedTime, bResetUtc);
@@ -5223,11 +5337,11 @@ namespace CLIProxyAPI_GUI
             return (g5h, gWeek, c5h, cWeek);
         }
 
-        private static string FormatResetTime(DateTime? resetUtc)
+        private static string FormatResetTime(DateTime? resetUtc, int percent = -1)
         {
-            if (!resetUtc.HasValue) return "无数据";
+            if (!resetUtc.HasValue) return percent >= 100 ? "额度充足" : "无数据";
             TimeSpan diff = resetUtc.Value - DateTime.UtcNow;
-            if (diff.TotalSeconds <= 0) return "已刷新";
+            if (diff.TotalSeconds <= 0) return percent >= 100 ? "额度充足" : "已刷新";
             if (diff.TotalDays >= 1)
                 return $"{(int)diff.TotalDays} 天 {diff.Hours} 小时 {diff.Minutes} 分 {diff.Seconds:D2} 秒 后刷新";
             else if (diff.TotalHours >= 1)
@@ -5238,14 +5352,21 @@ namespace CLIProxyAPI_GUI
                 return $"{diff.Seconds} 秒 后刷新";
         }
 
-        private static string FormatResetTime(string resetTimeUtcStr)
+        private static string FormatResetTime(string resetTimeUtcStr, int percent = -1)
         {
-            if (string.IsNullOrEmpty(resetTimeUtcStr)) return "无数据";
+            if (string.IsNullOrEmpty(resetTimeUtcStr)) return percent >= 100 ? "额度充足" : "无数据";
             if (DateTime.TryParse(resetTimeUtcStr, out DateTime resetDt))
             {
-                return FormatResetTime(resetDt.ToUniversalTime());
+                return FormatResetTime(resetDt.ToUniversalTime(), percent);
             }
             return "计算中";
+        }
+
+        // 配额日志统一口径：一行里同时给出两个分组的 5h/周，避免各处各自只打一个分组被误读成串号
+        private static string FormatQuotaLog(((int percent, string time, DateTime? resetUtc) g5h, (int percent, string time, DateTime? resetUtc) gWeek,
+            (int percent, string time, DateTime? resetUtc) c5h, (int percent, string time, DateTime? resetUtc) cWeek) quota)
+        {
+            return $"Gemini: 5h {quota.g5h.percent}% | 周 {quota.gWeek.percent}% || Claude/GPT: 5h {quota.c5h.percent}% | 周 {quota.cWeek.percent}%";
         }
 
         private async Task<string?> RefreshAccessTokenAsync(string refreshToken)
@@ -5601,7 +5722,7 @@ namespace CLIProxyAPI_GUI
 
                 RefreshAccountsUIOnly();
                 UpdateMiniWidgetData();
-                Log($"[配额] 账号 {GetDisplayEmail(acc.Email)} 刷新完成: 5h {newQuota.g5h.percent}% | 周 {newQuota.gWeek.percent}%");
+                Log($"[配额] 账号 {GetDisplayEmail(acc.Email)} 刷新完成: {FormatQuotaLog(newQuota)}");
             }
             catch (Exception ex)
             {
@@ -5650,7 +5771,7 @@ namespace CLIProxyAPI_GUI
                         else if (_lastGoodQuotas.TryGetValue(acc.FilePath, out var lastGood) && IsQuotaResultValid(lastGood))
                         {
                             // 本次查询失败（网络/代理故障等）：降级显示上次成功数据，避免误导性“全部 0%”
-                            Log($"[降级] {acc.Email} 本次查询失败（疑似网络/代理故障），显示上次成功数据: 5h {lastGood.g5h.percent}% | 周 {lastGood.gWeek.percent}%");
+                            Log($"[降级] {acc.Email} 本次查询失败（疑似网络/代理故障），显示上次成功数据: {FormatQuotaLog(lastGood)}");
                             quota = lastGood;
                         }
                         _cachedQuotas.Add((acc, quota));
@@ -5747,7 +5868,7 @@ namespace CLIProxyAPI_GUI
                         accountCard.Child = cardStack;
                         QuotaAccountsContainer.Children.Add(accountCard);
 
-                        Log($"[配额] {acc.Email} ({platformName}) — 5h: {quota.c5h.percent}% | 周: {quota.cWeek.percent}%");
+                        Log($"[配额] {acc.Email} ({platformName}) — {FormatQuotaLog(quota)}");
                     }
                     catch (Exception ex)
                     {
@@ -5757,13 +5878,6 @@ namespace CLIProxyAPI_GUI
 
                 Log($"[完成] 配额查询结束。");
                 UpdateMiniWidgetData();
-
-                // 若定时预热处于有效期内，逐一检查满额/未唤醒账号并进行定向极简握手
-                if (IsWarmupActive())
-                {
-                    TxtRefreshBtn.Text = "🔥 预热握手中...";
-                    await CheckAndRunScheduledWarmupAsync();
-                }
             }
             catch (Exception ex)
             {
@@ -5778,11 +5892,13 @@ namespace CLIProxyAPI_GUI
 
         // =================== 定时预热核心握手与满额检测 ===================
 
+        // 必须用计入 5h 滑窗的 pro 档：实测 flash 档握手 75 次（全部 HTTP 200）后 gemini-5h 仍恒为
+        // 100% + resetTime 随查询浮动，即该请求不进这个桶，唤醒等于没做。名单取自 GeminiProtocolTranslator
         private static readonly string[] GeminiWarmupCandidates = new[]
         {
-            "gemini-3.5-flash-low",
-            "gemini-3.6-flash-high",
-            "gemini-2.5-flash"
+            "gemini-3.7-pro-low",
+            "gemini-3.7-pro-high",
+            "gemini-3.1-pro-high"
         };
 
         private static readonly string[] ClaudeWarmupCandidates = new[]
@@ -5793,59 +5909,114 @@ namespace CLIProxyAPI_GUI
 
         private (bool needWarmup, string reason) NeedsWarmup((int percent, string time, DateTime? resetUtc) quota5h, string filePath, string modelGroup)
         {
-            // 1. 若数据无效或为 0%，且无倒计时，不唤醒
-            if (quota5h.percent <= 0 && string.Equals(quota5h.time, "无数据", StringComparison.OrdinalIgnoreCase))
-                return (false, "无配额数据");
+            string key = $"{filePath}:{modelGroup}";
+            if (!_warmupRecords.TryGetValue(key, out WarmupRecord? rec) || rec == null)
+            {
+                rec = new WarmupRecord();
+                _warmupRecords[key] = rec;
+            }
+            DateTime now = DateTime.UtcNow;
 
-            // 2. 配额不满 100%（使用中）：绝不预热，避免干扰用户正常使用或消耗正在使用的宝贵额度
+            // 1. 配额不满 100%（使用中）：绝不预热，避免干扰用户正常使用或消耗正在使用的宝贵额度
             if (quota5h.percent < 100)
+            {
+                NoteUpstreamChanged(rec);
                 return (false, $"配额使用中 (剩余 {quota5h.percent}%)");
-
-            // 3. 检查真实 UTC 倒计时是否已经自然到期（<= 0 秒，卡片显示“已刷新”或剩余 0 秒）：
-            //    一旦到期，立即触发唤醒开启新 5 小时滑动窗口（优先于 _lastWarmupTimestamps 冷却限制）
-            if (quota5h.resetUtc.HasValue && (quota5h.resetUtc.Value - DateTime.UtcNow).TotalSeconds <= 0)
-            {
-                return (true, "倒计时已自然到期 (已刷新)");
             }
 
-            // 4. 检查距上次本应用预热成功时间：若在 5 小时保护期内，说明滑动窗口已成功激活锁定，绝不重复握手
-            string warmupKey = $"{filePath}:{modelGroup}";
-            if (_lastWarmupTimestamps.TryGetValue(warmupKey, out DateTime lastWarmupTime))
+            // 2. 上游没给 resetTime：拿不到真实依据就不发握手请求
+            if (!quota5h.resetUtc.HasValue || string.Equals(quota5h.time, "无数据", StringComparison.Ordinal))
+                return (false, "上游未给出 resetTime，保守跳过");
+
+            double? gapSec = rec.ObservedAtUtc.HasValue ? (now - rec.ObservedAtUtc.Value).TotalSeconds : null;
+
+            // 3. 采样不足则只登记基准，本轮不判定。
+            //    间隔过短时两点差值淹没在噪声里；间隔过久（软件闲置）基准已失效，重取
+            if (!gapSec.HasValue || !rec.ObservedResetUtc.HasValue || gapSec.Value > WarmupMaxSampleGapMinutes * 60)
             {
-                var elapsed = DateTime.UtcNow - lastWarmupTime;
-                if (elapsed.TotalHours < 5.0)
-                {
-                    int remMinutes = (int)(TimeSpan.FromHours(5) - elapsed).TotalMinutes;
-                    return (false, $"在5h预热保护期内 (剩余约 {remMinutes} 分钟)");
-                }
+                TakeSample(rec, quota5h.resetUtc, now);
+                return (false, "已登记上游基准，待下一轮比对");
+            }
+            if (gapSec.Value < WarmupMinSampleGapSeconds)
+                return (false, $"样本间隔仅 {(int)gapSec.Value} 秒，沿用旧基准等待比对");
+
+            // 4. 核心判据：resetTime 跟着查询时刻往后挪 → 该桶根本没有活跃窗口（Google 对满额桶
+            //    固定回「查询时刻 + 5h」的浮动值）；resetTime 钉住不动 → 真实窗口正在倒计时。
+            //    浮动时 drift≈采样间隔、钉住时 drift≈0（上游秒级取整的噪声远小于半间隔），故阈值取半间隔
+            double driftSec = (quota5h.resetUtc.Value - rec.ObservedResetUtc.Value).TotalSeconds;
+            bool windowCountingDown = quota5h.resetUtc.Value > now && driftSec < gapSec.Value * 0.5;
+            TakeSample(rec, quota5h.resetUtc, now);
+
+            // 到期时刻已过期＝上游那条读数不再代表活跃窗口，即便钉着也按"无活跃窗口"处理，否则会永久卡住不唤醒
+            if (windowCountingDown)
+            {
+                NoteUpstreamChanged(rec);
+                return (false, $"上游固定窗口倒计时中 (剩余 {FormatResetTime(quota5h.resetUtc, quota5h.percent)})");
             }
 
-            // 5. 配额满额 100%：检查真实 UTC 倒计时状态
-            if (quota5h.resetUtc.HasValue)
+            // 5. 短防抖：刚握手过就复检，上游 summary 可能还没同步，避免连续重复握手烧真实额度
+            if (rec.LastWarmupUtc.HasValue && (now - rec.LastWarmupUtc.Value).TotalSeconds < WarmupDebounceSeconds)
+                return (false, $"防抖期内 (距上次握手 {(int)(now - rec.LastWarmupUtc.Value).TotalSeconds} 秒，等待上游同步)");
+
+            // 6. 未见效退避：握手返回 200 但上游状态照旧（实测 flash 档连续 75 次全部无效），说明这类请求
+            //    根本不进这个桶，判定条件会永久成立。按 5→30→180 分钟拉长本机复检间隔，只限制自己发请求的频率
+            if (rec.BackoffUntilUtc.HasValue && now < rec.BackoffUntilUtc.Value)
+                return (false, $"已唤醒 {rec.WakeAttempts} 次而上游状态未变，退避中 ({rec.BackoffUntilUtc.Value.ToLocalTime():HH:mm} 前不再握手)");
+
+            // 7. 满额 + 上游无活跃窗口 → 握手激活
+            int attemptsBefore = rec.WakeAttempts;
+            rec.WakeAttempts = attemptsBefore + 1;
+            if (attemptsBefore > 0)
+                rec.BackoffUntilUtc = now.AddMinutes(IneffectiveWakeBackoffMinutes(attemptsBefore));
+            string retryTag = attemptsBefore > 0 ? $"，第 {rec.WakeAttempts} 次尝试" : "";
+            return (true, (quota5h.resetUtc.Value <= now
+                ? "满额且上游窗口已过期 (resetTime 已到手)"
+                : $"满额且上游无活跃窗口 (resetTime 随查询浮动，漂移 {(int)driftSec} 秒)") + retryTag);
+        }
+
+        // 上游状态一旦变化（开始消耗 / 出现真实窗口），冷态即已解除，尝试计数与退避一并归零
+        private static void NoteUpstreamChanged(WarmupRecord rec)
+        {
+            if (rec.WakeAttempts == 0 && !rec.BackoffUntilUtc.HasValue) return;
+            rec.WakeAttempts = 0;
+            rec.BackoffUntilUtc = null;
+        }
+
+        // 退避阶梯：第 1 次无效后等 5 分钟，第 2 次等 30 分钟，此后每轮 3 小时
+        private static double IneffectiveWakeBackoffMinutes(int failedAttempts) => failedAttempts switch
+        {
+            <= 1 => 5,
+            2 => 30,
+            _ => 180
+        };
+
+        private static void TakeSample(WarmupRecord rec, DateTime? resetUtc, DateTime observedAtUtc)
+        {
+            rec.ObservedResetUtc = resetUtc;
+            rec.ObservedAtUtc = observedAtUtc;
+        }
+
+        // 日志用：把上游 resetTime 摊平成"精确到期时刻 + 距现在多久"，方便肉眼比对两次读数是否浮动
+        private static string ResetUtcDesc(DateTime? resetUtc)
+        {
+            if (!resetUtc.HasValue) return "无 resetTime";
+            double minutes = (resetUtc.Value - DateTime.UtcNow).TotalMinutes;
+            return $"{resetUtc.Value:HH:mm:ss}Z/{minutes:+0.0;-0.0}分钟";
+        }
+
+        // 握手成功：记下时刻用于防抖，并清空采样基准——握手前那条浮动值与握手后的真实到期时刻
+        // 几乎重合（都约等于「现在 + 5h」），留着旧基准会把真窗口误判成浮动值而反复握手
+        private void RecordWarmupHandshake(string filePath, string modelGroup)
+        {
+            string key = $"{filePath}:{modelGroup}";
+            if (!_warmupRecords.TryGetValue(key, out WarmupRecord? rec) || rec == null)
             {
-                TimeSpan diff = quota5h.resetUtc.Value - DateTime.UtcNow;
-
-                // 倒计时正在活跃计时（> 0 秒且 < 4 小时 45 分钟）：
-                // 说明已有真实倒计时正在递减（例如用户之前手动调用或之前已被唤醒），切勿重复预热
-                if (diff.TotalMinutes < 285)
-                {
-                    return (false, $"处于活跃倒计时中 (剩余 {FormatResetTime(quota5h.resetUtc)})");
-                }
-
-                // 属于 100% 满额且倒计时在 4 小时 45 分钟以上（Google 冷态未激活时每次查询都会动态返回「查询时刻 + 5h」浮动倒计时）：
-                // 需要触发定向直连握手将其固定激活锁定
-                return (true, $"100%满额冷态 (浮动倒计时 {FormatResetTime(quota5h.resetUtc)}，需激活锁定)");
+                rec = new WarmupRecord();
+                _warmupRecords[key] = rec;
             }
-
-            // 6. 若无 resetUtc：状态为“已刷新”或“无数据”等冷态，需要握手激活
-            if (string.Equals(quota5h.time, "已刷新", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(quota5h.time, "无数据", StringComparison.OrdinalIgnoreCase) ||
-                string.IsNullOrEmpty(quota5h.time))
-            {
-                return (true, "满额冷态无倒计时");
-            }
-
-            return (false, "无需预热");
+            rec.LastWarmupUtc = DateTime.UtcNow;
+            rec.ObservedResetUtc = null;
+            rec.ObservedAtUtc = null;
         }
 
         private async Task CheckAndRunScheduledWarmupAsync()
@@ -5879,15 +6050,31 @@ namespace CLIProxyAPI_GUI
                     var acc = item.acc;
                     var quota = item.quota;
 
-                    // Gemini 与 Claude/Opus 拥有独立配额桶（gemini-5h 与 3p-5h），完全独立判定，互不影响
-                    var (needGemini, geminiReason) = NeedsWarmup(quota.g5h, acc.FilePath, "gemini");
-                    var (needClaude, claudeReason) = NeedsWarmup(quota.c5h, acc.FilePath, "claude");
-
-                    if (!needGemini && !needClaude)
+                    // 缓存只当廉价预筛：两分组都不满 100% 就无需真查上游。正式判定必须基于新鲜读数，
+                    // 因为 resetTime 的真假要靠它与上一轮读数的差值来识别
+                    if (quota.g5h.percent < 100 && quota.c5h.percent < 100)
                     {
-                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} - Gemini: {geminiReason} | Claude: {claudeReason}");
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} Gemini {quota.g5h.percent}% / Claude {quota.c5h.percent}% 均在使用中，跳过真查");
                         continue;
                     }
+
+                    var confirmed = await FetchRealTimeQuotaAsync(acc);
+                    if (!IsQuotaResultValid(confirmed))
+                    {
+                        Log($"[定时预热] {GetDisplayEmail(acc.Email)} 上游查询失败（疑似网络/代理故障），本轮保守跳过唤醒");
+                        continue;
+                    }
+
+                    _lastGoodQuotas[acc.FilePath] = confirmed;
+                    int confIdx = _cachedQuotas.FindIndex(q => string.Equals(q.acc.FilePath, acc.FilePath, StringComparison.OrdinalIgnoreCase));
+                    if (confIdx >= 0) _cachedQuotas[confIdx] = (acc, confirmed);
+
+                    // Gemini 与 Claude/Opus 拥有独立配额桶（gemini-5h 与 3p-5h），完全独立判定，互不影响
+                    var (needGemini, geminiReason) = NeedsWarmup(confirmed.g5h, acc.FilePath, "gemini");
+                    var (needClaude, claudeReason) = NeedsWarmup(confirmed.c5h, acc.FilePath, "claude");
+                    Log($"[定时预热] {GetDisplayEmail(acc.Email)} 上游判定 → Gemini: {geminiReason} | Claude: {claudeReason}");
+
+                    if (!needGemini && !needClaude) continue;
 
                     anyWarmed = true;
                     bool accountWarmed = false;
@@ -5900,7 +6087,7 @@ namespace CLIProxyAPI_GUI
                         var (ok, usedModel, ms, err) = await WarmupAccountGroupDirectAsync(acc, GeminiWarmupCandidates, "Gemini");
                         if (ok)
                         {
-                            _lastWarmupTimestamps[$"{acc.FilePath}:gemini"] = DateTime.UtcNow;
+                            RecordWarmupHandshake(acc.FilePath, "gemini");
                             successSent++;
                             accountWarmed = true;
                             AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] {GetDisplayEmail(acc.Email)} | Gemini分组 | 模型: {usedModel} | 状态: 握手成功 (HTTP 200, {ms}ms)");
@@ -5924,7 +6111,7 @@ namespace CLIProxyAPI_GUI
                         var (ok, usedModel, ms, err) = await WarmupAccountGroupDirectAsync(acc, ClaudeWarmupCandidates, "Claude");
                         if (ok)
                         {
-                            _lastWarmupTimestamps[$"{acc.FilePath}:claude"] = DateTime.UtcNow;
+                            RecordWarmupHandshake(acc.FilePath, "claude");
                             successSent++;
                             accountWarmed = true;
                             AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] {GetDisplayEmail(acc.Email)} | Claude分组 | 模型: {usedModel} | 状态: 握手成功 (HTTP 200, {ms}ms)");
@@ -5954,7 +6141,9 @@ namespace CLIProxyAPI_GUI
                             }
                             RefreshAccountsUIOnly();
                             UpdateMiniWidgetData();
-                            Log($"[定时预热] {GetDisplayEmail(acc.Email)} 唤醒完成，最新倒计时：Gemini ({refreshedQuota.g5h.time}) | Claude ({refreshedQuota.c5h.time})");
+
+                            // 只打印上游回读值：握手是否真的把窗口钉住，看下一条 resetTime 是否随查询浮动即可
+                            Log($"[定时预热] {GetDisplayEmail(acc.Email)} 唤醒完成，上游回读：Gemini {refreshedQuota.g5h.time} ({ResetUtcDesc(refreshedQuota.g5h.resetUtc)}) | Claude {refreshedQuota.c5h.time} ({ResetUtcDesc(refreshedQuota.c5h.resetUtc)})");
                         }
                     }
 
@@ -5982,6 +6171,10 @@ namespace CLIProxyAPI_GUI
                     SetWarmupStatus($"最近检测: {DateTime.Now:HH:mm:ss} | 配额无需唤醒 ({accountsToWarm.Count} 个账号正常)", "#16A34A");
                     AppendWarmupLog($"[{DateTime.Now:HH:mm:ss}] 定时检测: 扫描 {accountsToWarm.Count} 个账号，所有分组均在倒计时中或使用中，未触发唤醒。");
                 }
+
+                // 本轮有过握手尝试 → 立即落盘预热记录，防止进程退出后闸门归零导致重启即重复握手
+                // （握手失败时尝试计数同样累加，故不能只在成功时落盘）
+                if (totalSent > 0) SaveSettings();
             }
             catch (Exception ex)
             {
@@ -6213,7 +6406,7 @@ namespace CLIProxyAPI_GUI
                 FontFamily = new FontFamily("Cascadia Code, Consolas, Segoe UI"),
                 Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(_tcTextTertiary)),
                 VerticalAlignment = VerticalAlignment.Center,
-                Tag = resetUtc
+                Tag = resetUtc.HasValue ? (object)(resetUtc.Value, percent) : null
             };
             if (resetUtc.HasValue)
             {

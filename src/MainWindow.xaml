@@ -1115,7 +1115,7 @@
                                             </Grid.ColumnDefinitions>
                                             <StackPanel VerticalAlignment="Center">
                                                 <TextBlock Text="定时预热" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource ThemeTextPrimary}"/>
-                                                <TextBlock Text="自动刷新后，若账号 5h 配额为 100%（满额）且倒计时已到期或未激活，则自动发送消息唤醒 5 小时滚动倒计时。" FontSize="10" Foreground="{DynamicResource ThemeTextTertiary}" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                                <TextBlock Text="开启后，后台在 5h 倒计时自然到期后低频握手唤醒新滚动窗口。建议保持关闭，以严格展示 Google 真实配额与倒计时。" FontSize="10" Foreground="{DynamicResource ThemeTextTertiary}" TextWrapping="Wrap" Margin="0,2,0,0"/>
                                             </StackPanel>
                                             <Border Grid.Column="1" Background="{DynamicResource ThemeSegmentBg}" CornerRadius="7" Padding="3" VerticalAlignment="Center" Margin="12,0,0,0">
                                                 <Grid>

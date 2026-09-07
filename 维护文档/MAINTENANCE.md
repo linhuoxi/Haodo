@@ -2,7 +2,7 @@
 
 > **文档定位**：本文件是给**后来者 AI 与开发者**的完整软件说明书与维护手册。任何 AI 或人类开发者拿到本文件 + 源码，即可完全理解本软件的结构、机制、构建方式与维护流程。
 >
-> **当前版本**：v1.0.46（见项目根目录 `版本号.txt`）
+> **当前版本**：v1.0.48（见项目根目录 `版本号.txt`）
 > **目标平台**：Windows x64（原生 Windows，不使用 WSL）
 > **技术栈**：.NET 10、WPF、WinForms（NotifyIcon）、HttpListener、SSE 流式转发
 > **最后更新**：2026-09-06
@@ -422,6 +422,8 @@ response.created → response.item_added → response.output_text.delta* →
 ### 5.9 配额查询（功能 A 核心）
 
 - Antigravity：`POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`（body `{project: projectId}`，UA `antigravity`），解析 `groups` 数组按 displayName 分为「Gemini 模型分组」与「Claude/GPT 模型分组」，各自给出 5 小时/周额度百分比与重置时间（`FetchAntigravityQuotaAsync`）；Claude/GPT 分组为 Antigravity 接口返回的真实模型分组数据，非独立平台支持；
+- **时间口径**：上游 `buckets[].resetTime` 给的是「重置的绝对时刻」，其中**满额冷态桶的那条是随查询浮动的假倒计时**（见 5.15），其余桶为真实到期时刻；界面显示的「X 小时 X 分 X 秒 后刷新」是 `FormatResetTime` 用该时刻减本机 UTC 算出的差值，1 秒一跳由本地 `_countdownTimer` 驱动，期间不再请求上游。故「重置在哪一刻」可信、「还剩多久」依赖 Windows 时钟准确；两次真查之间（`autoRefreshIntervalMinutes`，默认 5 分钟）百分比为旧值，网络故障时还会降级显示 `_lastGoodQuotas` 的上次成功数据；
+- `5h`/`周` 两个标签与「Gemini 组 / Claude 组」归属都是按 `bucketId`、`displayName` 关键词匹配的启发式结果（上游未提供稳定枚举），Google 改命名会错标，但其中的百分比与 resetTime 仍是上游原值；
 - 已移除 Claude（`api.anthropic.com/api/oauth/usage`）、Codex/Grok/Kimi 等非 Gemini 平台的额度查询与占位 stub；
 - 详细背景见 `docs/AI平台OAuth额度查询机制深度分析报告.md`。
 
@@ -457,6 +459,35 @@ response.created → response.item_added → response.output_text.delta* →
 - 检查 `https://yusnip.top/version.json`，`build > CurrentBuildNum` 时弹更新窗（含 changelog 兜底文案）；
 - 确认后下载 `download_url` 的 Haodo.exe → 结束自身进程树 → 覆盖根目录（实际部署路径为服务器 `https://yusnip.top/Haodo.exe`）→ 重新启动。
 
+### 5.15 定时预热（冷态唤醒，判定一律以上游为准）
+
+- **目的**：账号处于「5h 满额 + 上游无活跃窗口」的冷态时，发一次最小 `generateContent`（文本 `hi`、`maxOutputTokens=1`）把 Google 的滑动窗口**启动**起来，使窗口从此刻开始计时、若干小时后自然刷新到满额，用户真正要用时额度已就绪。候选模型轮退见 `GeminiWarmupCandidates`/`ClaudeWarmupCandidates`；
+- **握手模型的硬约束（改名单前必读）**：`GeminiWarmupCandidates` **只能用 pro 档**（现名单 `gemini-3.7-pro-low` / `gemini-3.7-pro-high` / `gemini-3.1-pro-high`，取值均出自 `GeminiProtocolTranslator` 的映射表）。flash 档请求不计入 `gemini-5h` 桶，用它握手等于什么都没做（证据见下文「同日第三轮实测」）。候选轮退逻辑在 `WarmupAccountGroupDirectAsync`：某候选返回 404/400 时自动试下一个；
+- **上游行为实测结论（2026-09-06 由 `[上游原始]` 诊断日志定案，判据的地基）**：
+  - `retrieveUserQuotaSummary` 对**满额冷态桶**（`gemini-5h` / `3p-5h` 剩余 100%）返回的 `resetTime` 是「查询时刻 + 精确 300.0 分钟」的**浮动假倒计时**——每次查询都往后挪，它不代表任何真实窗口。识别特征就是那个「整 5 小时到秒」的取值；
+  - 对**有活跃窗口的桶**（如当时 79% / 84% 的桶）返回的是钉死不动的固定到期时刻；
+  - **同日第二轮实测（反向确认，判据成立的关键证据）**：三个账号的 `3p-5h` 都是满额 100%，而各自 `resetTime` 在 11:44:29→11:47:29 四路查询（跨 3 分钟）里完全不变（如 `08:34:36Z` 重复四次），只有「剩余分钟」随时间正常递减（290.1→289.1→288.1→287.1）——即 `drift≈0` → 判为「上游固定窗口倒计时中」→ 不握手，**符合预期**。这证明满额桶并非一律浮动，「有活跃窗口」与「冷态无窗口」在上游是两种可分辨的读数；
+  - **同日第三轮实测（客户日志，暴露出「判定正确但动作无效」的第三种坑）**：某账号 `gemini-5h` 整轮日志里恒为 100% 且 `resetTime` 持续浮动 → 判定链每次都正确判「该唤醒」，而旧名单（flash 档）握手 **75 次全部 HTTP 200**，上游状态**一丝不变**。结论：**握手请求返回 200 ≠ 进了这个桶**，判定条件因此永久成立、每两轮就重发一次真实请求。同账号的 `3p-5h`（Claude 分组，名单本就是 opus/sonnet）同期 74 次判为「固定窗口倒计时中」、0 次握手 → 反证判定链本身没问题，错在发的模型；
+  - 推论：**单条 `resetTime` 没有信息量**，「冷态」与「窗口刚启动且接近满额」两种状态读出来可能一模一样。分辨它们只能看这条值**随不随查询时刻移动**，所以软件不再本地推算任何窗口长度（5 小时兜底已彻底删除）；
+  - 附带结论：账号若长期被本地代理驱动，其窗口会一直处于「已激活」态，预热因此**几乎不会触发**——这是正确行为，不是漏握手。要看预热真握手，需让某账号彻底闲置到其 5h 窗口跑完、`percent` 回到 100% 且 `resetTime` 变回「查询时刻 + 整 5 小时」。
+- **触发**：`UpdateActiveCountdowns` 内 `_countdownTickCounter` 累计到 `WarmupScanIntervalTicks`(60 秒) 巡检一次，仅 `IsWarmupActive()` 为真时执行。该处**只做廉价预筛**「任一 5h 分组 `percent >= 100`」，绝不在此调用 `NeedsWarmup`（见下条副作用红线）；
+- **判定链 `NeedsWarmup`（七步，全部取值来自上游）**：
+  1. `percent < 100`（使用中）→ 跳过，绝不干扰正常使用；顺带 `NoteUpstreamChanged` 清零退避（桶开始消耗说明冷态已解除）；
+  2. 上游没给 `resetTime`（或该分组「无数据」）→ 跳过，**拿不到真实依据就不发握手请求**；
+  3. 采样不足 → 只登记基准不判定：首轮无基准、间隔 < `WarmupMinSampleGapSeconds`(40 秒)、基准超 `WarmupMaxSampleGapMinutes`(30 分钟，软件闲置后基准失效需重取)。**该下限必须明显低于 60 秒的巡检周期**：两者贴平时时钟一抖整轮比对就作废，日志表现为反复「样本间隔仅 34/51/59 秒」且判定来回晃（曾把两个值都写成 60 秒踩过这个坑）；
+  4. **核心判据（两点漂移）**：`drift = 本次 resetTime − 上次 resetTime`。`resetTime` 仍在未来且 `drift < 采样间隔的一半` → 上游有真实窗口在倒计时 → 跳过（同样 `NoteUpstreamChanged` 清零退避）；`drift` 接近采样间隔（跟着查询时刻往后挪）或到期时刻已经过去 → 认定无活跃窗口 → 进入唤醒流程。阈值取半间隔是因为浮动时 `drift≈间隔`、钉住时 `drift≈0`（仅秒级取整噪声），两侧都有量级余量；**不要改成固定秒数下限**，曾写成 `max(60, 间隔一半)` 时巡检间隔恰好 60 秒会卡在临界线上，上游一次取整就把冷态误判成"倒计时中"而永不唤醒；
+  5. 距上次握手 < `WarmupDebounceSeconds`(90 秒) → 防抖，等上游 summary 同步；
+  6. **未见效退避闸门**：退避截止时刻 `BackoffUntilUtc` 尚未到期 → 跳过并打「已唤醒 N 次而上游状态未变，退避中 (HH:mm 前不再握手)」。存在的理由就是第三轮实测那种「判定永远成立 + 握手永远 200」的死循环：只限制**我们自己发请求的频率**，不宣称任何窗口长度，因此不违反「以上游为准」；退避期间第 4 步的 `TakeSample` 照常执行，样本不会断档，退避一到就能立即比对；
+  7. 满额 + 上游无活跃窗口 + 过完上述所有闸门 → 定向握手。**计数在发请求之前**：`WakeAttempts++`，若此前已有过尝试则立刻按 `IneffectiveWakeBackoffMinutes` 设下一次退避截止（第 1 次无效后 5 分钟、第 2 次后 30 分钟、此后每轮 180 分钟），日志原因后缀「第 N 次尝试」。放在前面是为了握手失败（候选全 404）时也照样退避。
+- **副作用红线**：`NeedsWarmup` 判定即采样（内部 `TakeSample` 刷新基准），因此**一轮真查里每个分组只能调用它一次，且必须喂 `FetchRealTimeQuotaAsync` 的新鲜读数**。任何拿缓存快照去调它的写法都会污染样本对，把真实比对带偏——这是旧版「缓存预判 + 上游改判」两次调用被拆掉的根因；
+- **握手前必做上游复核**：`_cachedQuotas` 最长滞后一个自动刷新周期（默认 5 分钟），拿旧快照拍板会把「其实还在倒计时」与「其实早已重置」都判反。故流程是「缓存只预筛 → 真查一次 → 每组判定一次」；真查失败（网络/代理故障）时**保守不握手**；
+- **握手成功后的处理**：`RecordWarmupHandshake` 记下握手时刻（仅供第 5 步防抖）并**清空采样基准**。必须清空：握手前那条浮动值与握手后的真实到期时刻几乎重合（都约等于「现在 + 5h」），留着旧基准会把真窗口误判成浮动值而反复握手烧额度。清空后由握手后的两两采样重新识别——此时上游回的是钉死时刻，`drift≈0` → 判为「上游固定窗口倒计时中」，不再握手；
+- **退避只能由上游清零**：`RecordWarmupHandshake` **不碰** `WakeAttempts`/`BackoffUntilUtc`。把「我们发出了 200 的握手」当成「唤醒已生效」正是那 75 次无效握手的成因；唯一合法的清零入口是上游读数本身变了（第 1 步开始消耗、或第 4 步出现钉死窗口），即 `NoteUpstreamChanged`；
+- **持久化**：记录写在 `settings.json` 的 `warmupRecords`，键为 `凭证绝对路径:分组`，值为 `lastWarmupUtc`/`observedResetUtc`/`observedAtUtc`/`wakeAttempts`/`backoffUntilUtc`；**本轮只要发出过握手请求就 `SaveSettings`**（不只是成功时，否则候选全 404 的账号重启后计数归零、继续每两轮重发）。加载时过期退避连同计数直接丢弃、采样基准超 7 天也丢弃；落盘前剪掉凭证已删除，以及握手、采样基准、退避三者皆陈旧的记录。**不参与 Drive 云同步**（`CollectSyncConfig` 不含它）——键含本机绝对路径，跨机同步会误压制唤醒；
+- **诊断手段**：`FetchAntigravityQuotaAsync` 的 bucket 循环会打 `[上游原始] …resetTime=… (剩余 X 分钟) → 分组槽位`，用于核对上游到底给了什么、以及 `5h`/`weekly` 关键词归类是否猜对；排查预热不触发时先看这几行两次读数的分钟数是否在移动。
+- **旧实现缺陷（2026-09-06 改掉）**：曾以「上次握手时刻 + 固定 5 小时」作为唯一闸门，上游实际窗口更短时会错压数小时不再唤醒；且该字典纯内存，重启即归零。现**软件自身不再推算任何窗口长度**，全部判据来自上游返回值及其观测时刻。
+- **同日第二处缺陷（客户日志暴露，已改）**：判定链换成上游驱动后，握手名单里仍是 flash 档模型 —— 结果同一账号 75 次握手全部返回 HTTP 200，`gemini-5h` 却全程 100% + `resetTime` 恒定浮动，等于白白发真实请求。根因是**旧流程只以「200」自我确认，从不回看上游有没有因此变化**。现两处收口：名单换成 pro 档（见本节开头那条硬约束），并加第 6/7 步的「未见效退避」计数。
+
 ---
 
 ## 6. 配置与数据存储
@@ -476,6 +507,7 @@ isMiniOn, miniModeType("off"/"taskbar"/"floating"), miniWidgetBgColor, miniWidge
 miniWidgetIsTransparent, miniWidgetEdgeDock, miniWidgetHideCardBg, miniWidgetLeft/Top/Width/Height,
 mainWinLeft/Top/Width/Height, mainWinState, theme(系统/深色/浅色), dataDir(仅记录，读取时忽略不一致),
 autoRefreshInterval, autoCheckUpdateEnabled(自动检查更新), autoStartEnabled(开机自启动),
+warmupEnabled(定时预热开关), warmupRecords(预热判定记录，键"凭证绝对路径:分组"，含上游采样基准与未见效退避计数，仅本机不同步),
 isLocalProxyEnabled, localProxyPort(默认8317), localProxyApiKey(默认"sk-haodo-local"),
 maskAccountInfo(账号打码), 以及贴贴强调色/背景色等
 ```
@@ -598,7 +630,9 @@ dotnet publish src/CLIProxyAPI_GUI.csproj \
    https 地址时可填 `http://127.0.0.1:8317`（多数本地模型客户端支持）；
    若客户端强制 https，可用 `NODE_EXTRA_CA_CERTS` 指向 CA pem 或
    `NODE_TLS_REJECT_UNAUTHORIZED=0` 绕过（代码与证书残留均已清理）；
-8. **更新服务器**为固定域名（yusnip.top），迁移需同步改 `VersionJsonUrl` 与 `MainWindow.xaml.cs` 的更新逻辑。
+8. **更新服务器**为固定域名（yusnip.top），迁移需同步改 `VersionJsonUrl` 与 `MainWindow.xaml.cs` 的更新逻辑；
+9. **满额冷态桶的上游 `resetTime` 是「查询时刻 + 5h」的浮动假倒计时**（2026-09-06 实测，见 5.15）——单条读数无法区分「冷态无窗口」与「窗口刚启动且近满额」，只能靠两次采样的漂移识别。代价是唤醒前需攒够两个样本（约 2 分钟），**这是设计如此**：不要改回单轮判定，也不要恢复任何本地时长推算（旧的 5 小时乐观兜底已删除）；
+10. **预热握手返回 HTTP 200 ≠ 请求进了那个配额桶**（2026-09-06 客户日志实测，见 5.15 第三轮）——flash 档请求不计入 `gemini-5h`，用它唤醒会「永远成功、永远无效」。现两道防线：Gemini 分组只走 pro 档候选，以及「同一冷态下上游状态仍未变化就按 5→30→180 分钟退避」的计数闸门。
 
 ### 未来改进方向
 
