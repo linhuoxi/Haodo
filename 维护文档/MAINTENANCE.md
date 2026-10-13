@@ -2,10 +2,10 @@
 
 > **文档定位**：本文件是给**后来者 AI 与开发者**的完整软件说明书与维护手册。任何 AI 或人类开发者拿到本文件 + 源码，即可完全理解本软件的结构、机制、构建方式与维护流程。
 >
-> **当前版本**：v1.0.48（见项目根目录 `版本号.txt`）
+> **当前版本**：v1.0.50（见项目根目录 `版本号.txt`）
 > **目标平台**：Windows x64（原生 Windows，不使用 WSL）
 > **技术栈**：.NET 10、WPF、WinForms（NotifyIcon）、HttpListener、SSE 流式转发
-> **最后更新**：2026-09-06
+> **最后更新**：2026-10-13
 >
 > **路径约定**：本文档存放于项目根目录的 `维护文档/` 子目录。文中所有路径（`src/`、`scripts/`、`docs/` 等）
 > 一律相对**项目根目录**；只使用相对路径、系统环境变量（`%AppData%`、`%TEMP%` 等）或网络地址，
@@ -387,13 +387,14 @@ private static readonly HashSet<string> GeminiSchemaAllowedKeys = new HashSet<st
 ```
 
 **`SanitizeGeminiSchema(JsonElement)` 递归规则**：
+- `type` 数组：Gemini/Antigravity proto 的 `type` 是标量枚举，不能接收 JSON Schema 联合类型数组。`["string","null"]` 转为 `type:"string", nullable:true`，`null` 的顺序不影响转换；嵌套 `properties` / `items` 同样处理。多个非 null 类型近似取第一个，仅 null 或空数组用 `string` 兜底；这不是完整联合类型语义。`null` 分支优先于输入中的 `nullable:false`。类型归一化后仍执行缺失 array items 的补齐逻辑；
 - 对象：只保留白名单键；`properties` 的**键是用户自定义属性名（任意）必须全部保留**，仅递归清洗其值；`additionalProperties` 仅保留布尔值（对象形式如 `{"type":"string"}` 不支持，丢弃）；清洗后空对象补 `"type":"object"`（避免上游拒绝空 schema）；
 - 数组：逐项递归；
 - 标量：原样保留。
 
 **被移除的字段（探测确证上游不支持）**：`$schema`、`$id`、`$defs`、`definitions`、`propertyNames`、`patternProperties`、`const`、`$ref`、`$comment`、`enumDescriptions`、`enumTitles`、`prefill`、`deprecated`、`title`、`default`、`examples`、`uniqueItems`、`multipleOf`、`exclusiveMinimum`、`exclusiveMaximum`、`allOf`、`anyOf`、`oneOf`、`not`、`contains`、`minContains`、`maxContains`、`dependencies`、`propertyOrdering`、`readOnly`、`writeOnly` 等。
 
-**验证方式**：改白名单后运行回归脚本 `scripts/schema_regression_check.cs`（需先编译 src 生成 Haodo.dll；脚本通过反射调用真实编译产物中的私有 `SanitizeGeminiSchema`，用覆盖全部攻击面的合成 schema 断言：400 源字段必须清除、通用字段（bool additionalProperties/nullable/format/enum/minimum 等）必须保留、属性名恰好叫 `propertyNames` 的键必须保留、空对象补 type）。期望输出：`PASS: 白名单收敛验证通过`。
+**验证方式**：在项目根目录运行 `dotnet run --project scripts/schema_regression_check.csproj -c Release --artifacts-path obj/quicker-check -p:NuGetAudit=false -p:RestoreIgnoreFailedSources=true`。测试项目直接引用主工程，自动编译当前源码，无需查找旧 DLL；产物留在被忽略的根目录 `obj/` 下。脚本通过反射调用实际转换器的私有 `SanitizeGeminiSchema`，验证未知字段移除、通用字段保留、用户属性名保留、空对象补 type；另调用公开请求转换入口，覆盖 Chat Completions / Responses 的流式及非流式工具定义、可空类型数组、嵌套 items、缺失 items、与 schema 关键字同名的用户属性。期望输出：`PASS: 白名单收敛验证通过`。测试不联网、不读取凭证。
 
 **对照参考**：成熟 Go 网关 CLIProxyAPI 的 `internal/util/gemini_schema.go` 用黑名单 + 约束迁移到 description 的方式处理同一批字段（含同样的 propertyNames 400 历史修复）。本项目的白名单方案与它在字段交集上互相印证。
 
@@ -591,6 +592,7 @@ dotnet publish src/CLIProxyAPI_GUI.csproj \
 | 症状 | 原因 | 处理 |
 |---|---|---|
 | `400 Unknown name "propertyNames" ... Cannot find field` | schema 含上游不支持字段 | 白名单清洗（5.5）已覆盖；若出现新字段名，把它加入被移除集合并跑回归 |
+| `400 Unknown name "type" ... Proto field is not repeating, cannot start list` | 工具参数的 `type` 是数组（常见于可空联合类型），但上游要求单个枚举 | v1.0.50 起递归归一化 type 数组并保留 nullability（见 5.5）；更新后重启 Haodo 再试 |
 | `404 Requested entity was not found` | 模型名不是上游合法键 | 检查 `MapModel` 与 `KnownModelKeys`；`GetModelRetryCandidate` 自动兜底一次 |
 | 上游 404 但代码没重试 | 模型不是 gemini- 前缀 | `GetModelRetryCandidate` 只处理 gemini- 系列 |
 | 空响应（无文本无工具） | 上游对"系统提示强调工具+工具定义"返回空 | 自动移除 tools 重试（5.6）；日志可见 `[chat流]/[Responses流] ... 移除 tools 后重试` |
@@ -656,3 +658,10 @@ dotnet publish src/CLIProxyAPI_GUI.csproj \
 ---
 
 *本文件由 AI 维护助手在 2026-08-07 基于源码逐文件核对生成；此后任何代码变更必须同步更新本文件。*
+
+### 2026-10-13 · v1.0.50：Quicker agent 工具 Schema 兼容修复
+
+- 来源核对：Haodo 使用参考 CLIProxyAPI 的 C# 原生转换器，并未嵌入 Go 内核或通过包管理引用其版本。上游最新发布为 [v8.0.27](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.27)（查询日期 2026-10-13），不能直接替换为 Haodo 内核；本次仅移植与报错有关的类型数组处理，未声称完整同步该版本。
+- 同类上游记录：[Issue #1513](https://github.com/router-for-me/CLIProxyAPI/issues/1513)、[已合并 PR #1511](https://github.com/router-for-me/CLIProxyAPI/pull/1511)，以及当前 `internal/util/gemini_schema.go` 的 schema 归一化流程。
+- 本地合成请求在修复前复现 type 数组透传、nullable 丢失以及 array items 补齐失效；修复后原白名单用例和四种请求组合全部通过。
+- 尚未取得 Quicker 的完整原始请求，也未调用真实上游验证；本地回归确认的是协议转换缺陷已修正，最终需要在 Quicker 中重新运行原 agent 验证。

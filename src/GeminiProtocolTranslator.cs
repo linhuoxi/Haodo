@@ -571,6 +571,7 @@ namespace CLIProxyAPI_GUI
         /// <summary>
         /// 递归清洗 JSON Schema 为 Gemini 兼容结构（仅保留白名单字段）。
         /// 注意: "properties" 的键是用户属性名（任意），必须全部保留，只有值需要递归清洗。
+        /// type 数组降为首个非 null 类型；null 分支转为 nullable，避免 proto 标量字段收到列表。
         /// 若类型为 array 且缺少 items，补齐默认 items: { type: "string" } 避免上游 400。
         /// </summary>
         private static object? SanitizeGeminiSchema(JsonElement schema)
@@ -582,7 +583,25 @@ namespace CLIProxyAPI_GUI
                     foreach (var prop in schema.EnumerateObject())
                     {
                         if (!GeminiSchemaAllowedKeys.Contains(prop.Name)) continue;
-                        if (prop.NameEquals("properties"))
+                        if (prop.NameEquals("type") && prop.Value.ValueKind == JsonValueKind.Array)
+                        {
+                            // JSON Schema 允许 type: ["string", "null"]，但 Antigravity Schema.type
+                            // 是单个枚举。多非 null 联合只能近似为第一个类型；仅 null 时用 string 兜底。
+                            string? selectedType = null;
+                            foreach (var candidate in prop.Value.EnumerateArray())
+                            {
+                                if (candidate.ValueKind != JsonValueKind.String) continue;
+                                string? candidateType = candidate.GetString();
+                                if (string.Equals(candidateType, "null", StringComparison.OrdinalIgnoreCase)) continue;
+                                if (!string.IsNullOrWhiteSpace(candidateType))
+                                {
+                                    selectedType = candidateType;
+                                    break;
+                                }
+                            }
+                            result["type"] = selectedType ?? "string";
+                        }
+                        else if (prop.NameEquals("properties"))
                         {
                             if (prop.Value.ValueKind != JsonValueKind.Object) continue;
                             var propsDict = new Dictionary<string, object?>();
@@ -602,6 +621,13 @@ namespace CLIProxyAPI_GUI
                         {
                             result[prop.Name] = SanitizeGeminiSchema(prop.Value);
                         }
+                    }
+                    // 放在字段遍历后，避免输入 nullable:false 覆盖 type 数组中的 null 分支。
+                    if (schema.TryGetProperty("type", out var sourceType) && sourceType.ValueKind == JsonValueKind.Array
+                        && sourceType.EnumerateArray().Any(t => t.ValueKind == JsonValueKind.String
+                            && string.Equals(t.GetString(), "null", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        result["nullable"] = true;
                     }
                     // 清洗后至少保留 type，避免空 schema 被上游拒绝
                     if (result.Count == 0)
